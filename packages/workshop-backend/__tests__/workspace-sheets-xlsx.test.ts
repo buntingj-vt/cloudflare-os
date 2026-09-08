@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { ExportHandler, Gadget } from "../format-blueprints/workspace-sheets/files/server.js";
-import { workbookToXlsx } from "../format-blueprints/workspace-sheets/files/xlsx.js";
-import { createZip, crc32 } from "../format-blueprints/workspace-sheets/files/zip.js";
+import { ExportHandler, Gadget } from "../format-blueprints/workspace-sheets/files/server.ts";
+import { workbookToXlsx } from "../format-blueprints/workspace-sheets/files/lib/xlsx.ts";
+import { createZip, crc32 } from "../format-blueprints/workspace-sheets/files/lib/zip.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

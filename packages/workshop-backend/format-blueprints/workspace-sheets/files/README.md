@@ -172,6 +172,10 @@ calls back on. The Durable Object keeps its own mutation queue and subscriber ma
 broadcasts run outside the queue so a callback may re-enter it). The cell model, the formula engine,
 the grid, the sheet tabs and the exports are this gadget's own.
 
+In the repository the source is TypeScript under `format-blueprints/workspace-sheets/files/`
+(`client.ts`, `server.ts`, `lib/protocol.ts`, `lib/xlsx.ts`, `lib/zip.ts`), which the build bundles
+into the `client.js` and `server.js` shipped here.
+
 ### `client.js`
 
 Builds the entire browser interface in JavaScript. It contains:
@@ -197,11 +201,12 @@ Exports the Durable Object class `Gadget`, which is the authoritative persistenc
 - Sanitizes titles, dimensions, cell contents, references, and formatting
 - Advertises and produces the server-side workbook and CSV exports
 
-### `xlsx.js` and `zip.js`
+### XLSX and ZIP modules (bundled into `server.js`)
 
-`xlsx.js` converts a complete document snapshot into a streaming XLSX workbook: sparse worksheet XML
-with inline strings, deduplicated styles, and frozen panes. `zip.js` is a dependency-free streaming
-ZIP writer (raw DEFLATE via `CompressionStream`, incremental CRC32, data descriptors).
+The XLSX module converts a complete document snapshot into a streaming XLSX workbook: sparse
+worksheet XML with inline strings, deduplicated styles, and frozen panes. The ZIP module is a
+dependency-free streaming ZIP writer (raw DEFLATE via `CompressionStream`, incremental CRC32, data
+descriptors). Both are bundled into `server.js`.
 
 ## Storage model
 

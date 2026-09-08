@@ -17,6 +17,11 @@ neutral sidebars so the slide canvas remains the visual focus.
 - `gadget.json` — which shared gadget libraries this deck loads, and where
   from.
 
+In the repository these two modules are TypeScript (`client.ts`, `server.ts`
+and the shared `lib/protocol.ts` types under
+`format-blueprints/workspace-slides/files/`), which the build bundles into the
+`client.js` and `server.js` installed here.
+
 ## Gadget libraries
 
 Three pieces of this deck are not its own: the element builder, the two

@@ -1,5 +1,51 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
-import { workbookToXlsx } from "./xlsx.js";
+import { workbookToXlsx } from "./lib/xlsx.ts";
+import type {
+  Cell,
+  CellConflict,
+  CellDeletion,
+  CellFmt,
+  CellMap,
+  CellOp,
+  CellUpsert,
+  CollaboratorInfo,
+  Dims,
+  DocumentMeta,
+  GadgetStub,
+  Operation,
+  OperationEvent,
+  OperationResult,
+  PresenceUpdate,
+  SheetMeta,
+  SheetsDocument,
+  SheetsPresenceEvent,
+  SubscriberCallbacks,
+} from "./lib/protocol.ts";
+
+// A subscribed client as this object holds it: its callbacks, seen through the Workers RPC stub
+// that delivered them, plus what the RPC layer adds -- the `dup` that keeps the stub past the call
+// it arrived in, the disconnection hook, and the disposer that releases it.
+interface SubscriberStub extends SubscriberCallbacks {
+  dup(): SubscriberStub;
+  onRpcBroken(handler: (error: unknown) => void): void;
+  [Symbol.dispose](): void;
+}
+
+// What `applyOperationLocked` hands back: the caller's reply, and the event to broadcast when
+// anything changed.
+interface LockedOutcome {
+  result: OperationResult;
+  event?: OperationEvent;
+}
+
+// One export option as the platform lists it.
+interface ExportFormat {
+  id: string;
+  label: string;
+  mode: "server";
+  contentType: string;
+  fileExtension: string;
+}
 
 const DEFAULT_TITLE = "Untitled spreadsheet";
 const DEFAULT_ROWS = 100;
@@ -16,8 +62,11 @@ const DEFAULT_COLS = 26;
 // Structure (sheet list, names, dimensions, column widths, row heights, title)
 // is last-writer-wins metadata applied wholesale when a client sends it.
 // ---------------------------------------------------------------------------
-export class Gadget extends DurableObject {
-  constructor(ctx, env) {
+export class Gadget extends DurableObject<unknown, unknown> {
+  declare subscribers: Map<SubscriberStub, CollaboratorInfo>;
+  declare mutationQueue: Promise<unknown>;
+
+  constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
     this.ctx = ctx;
     this.subscribers = new Map();
@@ -27,19 +76,19 @@ export class Gadget extends DurableObject {
     this.mutationQueue = Promise.resolve();
   }
 
-  enqueueMutation(fn) {
+  enqueueMutation<T>(fn: () => Promise<T> | T): Promise<T> {
     const result = this.mutationQueue.then(fn);
     this.mutationQueue = result.catch(() => {});
     return result;
   }
 
-  newId() {
-    if (globalThis.crypto?.randomUUID) return "s_" + crypto.randomUUID().slice(0, 8);
+  newId(): string {
+    if ((globalThis as typeof globalThis & { crypto?: Crypto }).crypto?.randomUUID) return "s_" + crypto.randomUUID().slice(0, 8);
     return "s_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   }
 
-  async loadMeta() {
-    let meta = await this.ctx.storage.get("meta");
+  async loadMeta(): Promise<DocumentMeta> {
+    let meta = await this.ctx.storage.get<DocumentMeta>("meta");
     if (!meta) {
       const id = this.newId();
       meta = {
@@ -55,12 +104,12 @@ export class Gadget extends DurableObject {
     return meta;
   }
 
-  async loadCells(id) {
-    return (await this.ctx.storage.get("cells:" + id)) || {};
+  async loadCells(id: string): Promise<CellMap> {
+    return (await this.ctx.storage.get<CellMap>("cells:" + id)) || {};
   }
 
-  async assembleDocument(meta) {
-    const cells = {};
+  async assembleDocument(meta: DocumentMeta): Promise<SheetsDocument> {
+    const cells: Record<string, CellMap> = {};
     for (const id of meta.sheetOrder) cells[id] = await this.loadCells(id);
     return {
       revision: meta.revision,
@@ -72,11 +121,11 @@ export class Gadget extends DurableObject {
     };
   }
 
-  getDocument() {
+  getDocument(): Promise<SheetsDocument> {
     return this.enqueueMutation(async () => this.assembleDocument(await this.loadMeta()));
   }
 
-  async applyOperation(operation) {
+  async applyOperation(operation: Operation): Promise<OperationResult> {
     const { result, event } = await this.enqueueMutation(() => this.applyOperationLocked(operation));
     // Issued after the queue releases, so callbacks may re-enter it, but
     // synchronously here, before the next queued mutation can reach storage,
@@ -85,7 +134,7 @@ export class Gadget extends DurableObject {
     return result;
   }
 
-  async applyOperationLocked(operation) {
+  async applyOperationLocked(operation: Operation): Promise<LockedOutcome> {
     const meta = await this.loadMeta();
     let changed = false;
 
@@ -93,10 +142,10 @@ export class Gadget extends DurableObject {
     if (operation.structure) {
       const s = operation.structure;
       const order = Array.isArray(s.sheetOrder) ? s.sheetOrder.map(String) : meta.sheetOrder;
-      const nextSheets = {};
+      const nextSheets: Record<string, SheetMeta> = {};
       for (const id of order) {
-        const incoming = s.sheets?.[id] || {};
-        const existing = meta.sheets[id] || {};
+        const incoming: Partial<SheetMeta> = s.sheets?.[id] || {};
+        const existing: Partial<SheetMeta> = meta.sheets[id] || {};
         nextSheets[id] = sheetMeta({
           id,
           name: incoming.name ?? existing.name ?? "Sheet",
@@ -133,14 +182,14 @@ export class Gadget extends DurableObject {
     }
 
     // --- Per-cell operations (optimistic concurrency) --------------------
-    const upserts = [];
-    const deletes = [];
-    const conflicts = [];
-    const bySheet = new Map();
+    const upserts: CellUpsert[] = [];
+    const deletes: CellDeletion[] = [];
+    const conflicts: CellConflict[] = [];
+    const bySheet = new Map<string, CellOp[]>();
     for (const op of operation.cellOps || []) {
       const sid = String(op.sheetId || "");
       if (!bySheet.has(sid)) bySheet.set(sid, []);
-      bySheet.get(sid).push(op);
+      bySheet.get(sid)!.push(op);
     }
     for (const [sheetId, ops] of bySheet) {
       if (!meta.sheets[sheetId]) continue;
@@ -160,7 +209,7 @@ export class Gadget extends DurableObject {
           dirty = true;
         } else {
           if (cur && cur.version !== base) { conflicts.push({ sheetId, ref, cell: cur }); continue; }
-          const next = {
+          const next: Cell = {
             value: op.value == null ? "" : String(op.value).slice(0, 8192),
             fmt: sanitizeFmt(op.fmt),
             version: (cur?.version || 0) + 1,
@@ -185,7 +234,7 @@ export class Gadget extends DurableObject {
     // sheetReplacements imply the caller already has the new cells locally, so
     // we only rebroadcast the small per-cell diffs plus structure. Peers that
     // received a replacement re-fetch via the accompanying snapshot flag.
-    const event = {
+    const event: OperationEvent = {
       type: "operation",
       senderId: operation.senderId,
       revision: meta.revision,
@@ -204,8 +253,8 @@ export class Gadget extends DurableObject {
   }
 
   // --- Presence & subscription ------------------------------------------
-  async subscribe(callback, client = {}) {
-    const info = {
+  async subscribe(callback: SubscriberStub, client: Partial<CollaboratorInfo> = {}): Promise<SheetsDocument> {
+    const info: CollaboratorInfo = {
       clientId: String(client.clientId || ""),
       name: String(client.name || "Guest").slice(0, 40),
       color: String(client.color || "#e1632e"),
@@ -235,7 +284,7 @@ export class Gadget extends DurableObject {
     });
   }
 
-  updatePresence(presence) {
+  updatePresence(presence: Partial<PresenceUpdate>): void {
     this.broadcastPresence({
       type: "cursor",
       clientId: String(presence.clientId || ""),
@@ -248,23 +297,23 @@ export class Gadget extends DurableObject {
     });
   }
 
-  leavePresence(clientId) {
+  leavePresence(clientId: string): void {
     this.broadcastPresence({ type: "leave", clientId: String(clientId || ""), at: Date.now() });
   }
 
-  dropSubscriber(stub) {
+  dropSubscriber(stub: SubscriberStub): void {
     if (this.subscribers.delete(stub)) stub[Symbol.dispose]();
   }
 
   // Delivery is best-effort and not awaited: a callback that fails is dropped,
   // and one that never settles holds up nothing but its own client.
-  broadcast(event) {
+  broadcast(event: OperationEvent): void {
     for (const [stub] of this.subscribers) {
       Promise.resolve(stub.operation(event)).catch(() => this.dropSubscriber(stub));
     }
   }
 
-  broadcastPresence(event) {
+  broadcastPresence(event: SheetsPresenceEvent): void {
     for (const [stub] of this.subscribers) {
       Promise.resolve(stub.presence(event)).catch(() => this.dropSubscriber(stub));
     }
@@ -272,17 +321,17 @@ export class Gadget extends DurableObject {
 }
 
 // --- Sanitizers -------------------------------------------------------------
-function int(v) { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.max(0, n) : 0; }
-function clampInt(v, lo, hi, dflt) {
+function int(v: unknown): number { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.max(0, n) : 0; }
+function clampInt(v: unknown, lo: number, hi: number, dflt: number): number {
   const n = Math.round(Number(v));
   if (!Number.isFinite(n)) return dflt;
   return Math.max(lo, Math.min(hi, n));
 }
 
-function sanitizeDims(dims) {
-  const out = {};
+function sanitizeDims(dims: unknown): Dims {
+  const out: Dims = {};
   if (dims && typeof dims === "object") {
-    for (const [k, v] of Object.entries(dims)) {
+    for (const [k, v] of Object.entries(dims as Record<string, unknown>)) {
       if (!/^\d+$/.test(k)) continue;
       const n = Math.round(Number(v));
       if (Number.isFinite(n) && n >= 8 && n <= 2000) out[k] = n;
@@ -291,7 +340,7 @@ function sanitizeDims(dims) {
   return out;
 }
 
-function sheetMeta(s) {
+function sheetMeta(s: Partial<SheetMeta> & Pick<SheetMeta, "id">): SheetMeta {
   return {
     id: String(s.id),
     name: String(s.name || "Sheet").slice(0, 60),
@@ -305,12 +354,15 @@ function sheetMeta(s) {
 }
 
 const FMT_KEYS = new Set(["b", "i", "u", "s", "c", "bg", "a", "nf", "d", "fs", "wrap"]);
-function sanitizeFmt(fmt) {
+function isFmtKey(k: string): k is keyof CellFmt { return FMT_KEYS.has(k); }
+function sanitizeFmt(fmt: unknown): CellFmt | null {
   if (!fmt || typeof fmt !== "object") return null;
-  const out = {};
-  for (const [k, v] of Object.entries(fmt)) {
-    if (!FMT_KEYS.has(k) || v == null || v === false || v === "") continue;
-    if (k === "c" || k === "bg") { if (/^#[0-9a-fA-F]{3,8}$/.test(v)) out[k] = v; }
+  const out: CellFmt = {};
+  for (const [k, v] of Object.entries(fmt as Record<string, unknown>)) {
+    if (!isFmtKey(k) || v == null || v === false || v === "") continue;
+    // TODO(types): a non-string whose string form matches (e.g. `["#abc"]`) passes the test and
+    // is stored as-is, as it always was; the cast records that the check is on `String(v)`.
+    if (k === "c" || k === "bg") { if (/^#[0-9a-fA-F]{3,8}$/.test(String(v))) out[k] = v as string; }
     else if (k === "a") { if (v === "l" || v === "c" || v === "r") out[k] = v; }
     else if (k === "nf") { out[k] = String(v).slice(0, 20); }
     else if (k === "d") { const n = Math.round(Number(v)); if (n >= 0 && n <= 10) out[k] = n; }
@@ -320,11 +372,11 @@ function sanitizeFmt(fmt) {
   return Object.keys(out).length ? out : null;
 }
 
-function sanitizeCellMap(map) {
-  const out = {};
+function sanitizeCellMap(map: unknown): CellMap {
+  const out: CellMap = {};
   if (!map || typeof map !== "object") return out;
   let count = 0;
-  for (const [ref, cell] of Object.entries(map)) {
+  for (const [ref, cell] of Object.entries(map as Record<string, Partial<Record<keyof Cell, unknown>> | null | undefined>)) {
     if (!/^[A-Z]+[0-9]+$/.test(ref) || count++ > 200000) continue;
     out[ref] = {
       value: cell?.value == null ? "" : String(cell.value).slice(0, 8192),
@@ -338,7 +390,7 @@ function sanitizeCellMap(map) {
 const CSV_FORMAT_PREFIX = "csv:";
 const MAX_CSV_SHEETS = 31; // The platform allows 32 formats; one is the workbook.
 const MAX_EXPORT_ID_LENGTH = 128;
-const XLSX_FORMAT = {
+const XLSX_FORMAT: ExportFormat = {
   id: "xlsx",
   label: "Excel Workbook",
   mode: "server",
@@ -348,16 +400,16 @@ const XLSX_FORMAT = {
 
 // Sheet ids are client-chosen, so duplicates and over-long ids are possible in
 // stored structure. Either would fail format validation and disable every export.
-function csvSheetIds(document) {
+function csvSheetIds(document: SheetsDocument): string[] {
   const ids = document.sheetOrder.filter((id) => (CSV_FORMAT_PREFIX + id).length <= MAX_EXPORT_ID_LENGTH);
   return Array.from(new Set(ids)).slice(0, MAX_CSV_SHEETS);
 }
 
 export class ExportHandler extends WorkerEntrypoint {
-  async getExportFormats(gadget) {
+  async getExportFormats(gadget: GadgetStub): Promise<ExportFormat[]> {
     const document = await gadget.getDocument();
     const sheetIds = csvSheetIds(document);
-    return [XLSX_FORMAT, ...sheetIds.map((sheetId) => ({
+    return [XLSX_FORMAT, ...sheetIds.map((sheetId): ExportFormat => ({
       id: CSV_FORMAT_PREFIX + sheetId,
       label: sheetIds.length === 1 ? "CSV" : "CSV (" + document.sheets[sheetId].name + ")",
       mode: "server",
@@ -366,7 +418,7 @@ export class ExportHandler extends WorkerEntrypoint {
     }))];
   }
 
-  async export(gadget, id) {
+  async export(gadget: GadgetStub, id: string): Promise<ReadableStream<Uint8Array>> {
     if (id === XLSX_FORMAT.id) {
       const document = await gadget.getDocument();
       return workbookToXlsx(document);
@@ -379,11 +431,11 @@ export class ExportHandler extends WorkerEntrypoint {
     if (!csvSheetIds(document).includes(sheetId)) {
       throw new Error("The selected worksheet is unavailable for CSV export.");
     }
-    return new Response(workbookSheetToCsv(document, sheetId)).body;
+    return new Response(workbookSheetToCsv(document, sheetId)).body!;
   }
 }
 
-function workbookSheetToCsv(document, sheetId) {
+function workbookSheetToCsv(document: SheetsDocument, sheetId: string): string {
   const cells = document.cells?.[sheetId] || {};
   let maxRow = -1;
   let maxColumn = -1;
@@ -396,9 +448,9 @@ function workbookSheetToCsv(document, sheetId) {
   }
   if (maxRow < 0 || maxColumn < 0) return "";
 
-  const rows = [];
+  const rows: string[] = [];
   for (let row = 0; row <= maxRow; ++row) {
-    const fields = [];
+    const fields: string[] = [];
     for (let column = 0; column <= maxColumn; ++column) {
       const value = cells[csvCellRef(row, column)]?.value ?? "";
       fields.push(escapeCsvField(value));
@@ -408,7 +460,7 @@ function workbookSheetToCsv(document, sheetId) {
   return rows.join("\r\n") + "\r\n";
 }
 
-function parseCsvCellRef(ref) {
+function parseCsvCellRef(ref: string): { row: number; column: number } | null {
   const match = /^([A-Z]+)([1-9]\d*)$/.exec(ref);
   if (!match) return null;
   let column = 0;
@@ -416,7 +468,7 @@ function parseCsvCellRef(ref) {
   return { row: Number(match[2]) - 1, column: column - 1 };
 }
 
-function csvCellRef(row, column) {
+function csvCellRef(row: number, column: number): string {
   let letters = "";
   for (let value = column + 1; value > 0; value = Math.floor((value - 1) / 26)) {
     letters = String.fromCharCode(65 + (value - 1) % 26) + letters;
@@ -424,7 +476,7 @@ function csvCellRef(row, column) {
   return letters + (row + 1);
 }
 
-function escapeCsvField(value) {
+function escapeCsvField(value: string): string {
   const text = String(value);
   return /[",\r\n]/.test(text) ? "\"" + text.replace(/\"/g, "\"\"") + "\"" : text;
 }

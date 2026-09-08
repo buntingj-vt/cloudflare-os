@@ -83,8 +83,30 @@ export default {
           'build:browser-runtime',
         ],
       },
+      /**
+       * The three `tsconfig.blueprints-*` configs type-check the TypeScript under
+       * `format-blueprints/<name>/`, so a type error in a bundled gadget fails the build the way
+       * one in `src/` does: each `client.ts` under the DOM lib, each `server.ts` under the Workers
+       * types, the blueprints' own tests under Node's, and every `lib/` module under whichever of
+       * those imports it. Each is its own command so each reports on its own; the reason there are
+       * three rather than one is that the three sets of globals must not see each other, and is
+       * written out in the configs.
+       *
+       * `tsconfig.blueprints-server.json` stands in for the bare `tsc` rather than joining it: it
+       * *is* this package's own program plus the blueprint servers, because the Workers types
+       * available here drag `src/` into any program that loads them. Running both would type-check
+       * `src/` twice for nothing.
+       *
+       * `build:format-blueprints` has already bundled the same sources by the time these run, so a
+       * module esbuild cannot resolve fails there first.
+       */
       build: {
-        command: ['tsc --project tsconfig.browser.json', 'tsc'],
+        command: [
+          'tsc --project tsconfig.browser.json',
+          'tsc --project tsconfig.blueprints-server.json',
+          'tsc --project tsconfig.blueprints-client.json',
+          'tsc --project tsconfig.blueprints-tests.json',
+        ],
         dependsOn: ['build:gadget-libraries', 'build:format-blueprints', 'build:browser-runtime'],
         cache: false,
       },
@@ -94,12 +116,15 @@ export default {
        * fleets), and vitest prints only as files complete, so a healthy run's silences stretch past
        * the default once the machine is contended. The wall-clock backstop still bounds a real hang.
        *
-       * The integration config is one file and keeps the default.
+       * The integration config is one file and keeps the default, as does the blueprints config:
+       * its two Node projects (the blueprints' own lib tests and the bundling tests of
+       * `scripts/format-blueprint-files.ts`) are small and import nothing heavy.
        */
       test: {
         ...vitestTask([
           { command: 'vitest run', idleSeconds: 120 },
           'vitest run --config vitest.integration.config.ts',
+          'vitest run --config vitest.blueprints.config.ts',
         ]),
         dependsOn: ['build:gadget-libraries', 'build:format-blueprints', 'build:browser-runtime'],
       },

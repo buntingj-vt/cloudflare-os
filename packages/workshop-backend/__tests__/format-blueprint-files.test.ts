@@ -35,6 +35,11 @@ async function sourceTree(files: Record<string, string>): Promise<string> {
   return directory;
 }
 
+// This file is collected twice: by vitest.config.ts inside workerd, and by
+// vitest.blueprints.config.ts in Node. Bundling runs esbuild's native binary, which only the Node
+// run can spawn, so those cases skip themselves under workerd rather than fail there.
+const inWorkerd = navigator.userAgent === "Cloudflare-Workers";
+
 describe("format blueprint source", () => {
   it("reconstructs files deterministically", () => {
     let files = new Map([
@@ -184,56 +189,259 @@ describe("format blueprint source", () => {
   });
 });
 
-describe("format blueprint library pins", () => {
-  const SYNC_PINS = '{"libraries": {"sync": "latest"}}\n';
-
-  it("passes a blueprint whose imports and pins agree", async () => {
+describe.skipIf(inWorkerd)("format blueprint TypeScript sources", () => {
+  it("bundles each entry with its lib imports into one JavaScript file", async () => {
     let directory = await sourceTree({
-      "client.js": 'import { SaveScheduler } from "gadgets:sync/client";\nvoid SaveScheduler;\n',
-      "server.js": 'export { MutationQueue } from "gadgets:sync/server";\n',
-      "gadget.json": SYNC_PINS,
+      "README.md": "# Example\n",
+      "client.ts": [
+        'import { greet } from "./lib/greeting.ts";',
+        'document.body.textContent = greet("caf\u00e9");',
+      ].join("\n"),
+      "server.ts": [
+        'import { DurableObject } from "cloudflare:workers";',
+        'import { VERSION } from "./lib/shared.ts";',
+        "export class Gadget extends DurableObject { version(): number { return VERSION; } }",
+      ].join("\n"),
+      "lib/greeting.ts": "export function greet(name: string): string { return `hello ${name}`; }",
+      "lib/shared.ts": "export const VERSION: number = 7;",
+      "lib/types.d.ts": "export type Never = never;",
+    });
+
+    let files = await readSourceFiles(directory, "example/files");
+
+    expect([...files.keys()]).toEqual(["README.md", "client.js", "server.js"]);
+    expect(files.get("README.md")).toBe("# Example\n");
+    let client = files.get("client.js")!;
+    // The lib module is inlined, typed and readable rather than imported, erased or minified.
+    expect(client).toContain("hello ${name}");
+    expect(client).not.toMatch(/from\s+"\.\/lib/u);
+    expect(client).not.toContain(": string");
+    expect(client).toContain("function greet(name)");
+    expect(client).toContain("caf\u00e9");
+    let server = files.get("server.js")!;
+    expect(server).toContain('from "cloudflare:workers"');
+    expect(server).toContain("VERSION = 7");
+    // esbuild gathers a bundle's exports into one trailing export list.
+    expect(server).toContain("Gadget = class extends DurableObject");
+    expect(server).toMatch(/export \{\s*Gadget\s*\};/u);
+    expect(server).not.toContain("./lib/shared");
+  });
+
+  it("keeps a non-TypeScript module a bundle inlined in the archive", async () => {
+    let directory = await sourceTree({
+      "client.ts": 'import data from "./lib/data.json"; console.log(data.answer);',
+      "lib/data.json": '{"answer": 42}',
+    });
+
+    let files = await readSourceFiles(directory, "example/files");
+
+    // Inlined into the bundle *and* still shipped: only TypeScript is build input, and dropping a
+    // file esbuild happened to inline would break whatever else in the archive imports it.
+    expect([...files.keys()]).toEqual(["client.js", "lib/data.json"]);
+    expect(files.get("client.js")).toContain("answer: 42");
+    expect(files.get("lib/data.json")).toBe('{"answer": 42}');
+  });
+
+  it("bundles one side while the other stays plain JavaScript", async () => {
+    let directory = await sourceTree({
+      "client.ts": 'import { shared } from "./lib/helpers.js";\ndocument.title = shared();',
+      "server.js": [
+        'import { shared } from "./lib/helpers.js";',
+        "export class Gadget { hi() { return shared(); } }",
+      ].join("\n"),
+      "lib/helpers.js": 'export function shared() { return "shared"; }',
+    });
+
+    let files = await readSourceFiles(directory, "example/files");
+
+    // The un-migrated side keeps its import, so the module it names has to survive the migration
+    // of the other side -- an archive whose server.js imports a file that is gone would fail to
+    // load with nothing to show for it at build time.
+    expect([...files.keys()]).toEqual(["client.js", "lib/helpers.js", "server.js"]);
+    expect(files.get("server.js")).toContain('from "./lib/helpers.js"');
+    expect(files.get("client.js")).toContain('return "shared"');
+    expect(files.get("client.js")).not.toMatch(/from\s+"\.\/lib/u);
+  });
+
+  it("leaves a JavaScript blueprint untouched and drops declaration files", async () => {
+    let directory = await sourceTree({
+      "client.js": "client\n",
+      "lib/util.js": "utility\n",
+      "lib/util.d.ts": "export {};\n",
+      "lib/util.d.mts": "export {};\n",
     });
 
     expect(await readSourceFiles(directory, "example/files")).toEqual(new Map([
-      ["client.js", 'import { SaveScheduler } from "gadgets:sync/client";\nvoid SaveScheduler;\n'],
-      ["gadget.json", SYNC_PINS],
-      ["server.js", 'export { MutationQueue } from "gadgets:sync/server";\n'],
+      ["client.js", "client\n"],
+      ["lib/util.js", "utility\n"],
+    ]));
+  });
+
+  it("rejects an entry present as both TypeScript and JavaScript", async () => {
+    let directory = await sourceTree({
+      "client.ts": "export {};",
+      "client.js": "export {};",
+    });
+
+    await expect(readSourceFiles(directory, "example/files"))
+      .rejects.toThrow("client.ts and client.js both define the client entry");
+  });
+
+  it("rejects TypeScript that is neither an entry nor a lib module", async () => {
+    let directory = await sourceTree({
+      "client.ts": "export {};",
+      "helpers.ts": "export const helper = 1;",
+    });
+
+    await expect(readSourceFiles(directory, "example/files"))
+      .rejects.toThrow("helpers.ts is not a gadget module");
+  });
+
+  it("keeps a module imported only for its types out of the archive", async () => {
+    let directory = await sourceTree({
+      "client.ts": [
+        'import { render } from "./lib/render.ts";',
+        'document.body.append(render({id: "a", text: "hi"}));',
+      ].join("\n"),
+      "lib/render.ts": [
+        'import type { Block } from "./types.ts";',
+        "export function render(block: Block): Text { return new Text(block.text); }",
+      ].join("\n"),
+      "lib/types.ts": "export type Block = { id: string; text: string };",
+    });
+
+    let files = await readSourceFiles(directory, "example/files");
+
+    // The shared contract is reached only through another lib module, and only in type position:
+    // nothing of it survives compilation, so no bundle can witness that it was imported at all.
+    expect([...files.keys()]).toEqual(["client.js"]);
+    expect(files.get("client.js")).toContain("new Text(block.text)");
+  });
+
+  it.each(["client.tsx", "lib/component.tsx", "lib/loader.mts", "lib/loader.cts"])(
+    "rejects TypeScript the gadget runtimes have no loader for: %s", async path => {
+      let directory = await sourceTree({"client.ts": "export {};", [path]: "export {};"});
+
+      await expect(readSourceFiles(directory, "example/files"))
+        .rejects.toThrow(`${path} is not a gadget module: gadget TypeScript is plain .ts`);
+    });
+
+  // Each entry may import only what its own runtime supplies, so a bare import has to fail the
+  // build: with no node_modules above the blueprint esbuild cannot resolve it at all, and with one
+  // it resolves to a file the "outside the blueprint" check below rejects. Either way the mistake
+  // surfaces here rather than inside the sandbox. `cloudflare:workers` is the interesting case: the
+  // server's Durable Object has it, the iframe does not.
+  it.each([
+    ["client", "yjs"],
+    ["client", "cloudflare:workers"],
+    ["server", "zod"],
+  ])("rejects %s.ts importing %s, which its runtime does not supply", async (entry, specifier) => {
+    let directory = await sourceTree({
+      [`${entry}.ts`]: `import * as module from "${specifier}";\nexport const value = module;\n`,
+    });
+
+    await expect(readSourceFiles(directory, "example/files")).rejects
+      .toThrow(new RegExp(`${entry}\\.ts failed to bundle: [\\s\\S]*Could not resolve "${
+        specifier}"`, "u"));
+  });
+
+  it("rejects a lib module no entry bundles", async () => {
+    let directory = await sourceTree({
+      "client.ts": "export {};",
+      "lib/unused.ts": "export const unused = 1;",
+    });
+
+    await expect(readSourceFiles(directory, "example/files"))
+      .rejects.toThrow("lib/unused.ts is not imported by any entry point");
+  });
+
+  it("rejects lib modules with no entry to bundle them", async () => {
+    let directory = await sourceTree({
+      "client.js": "export {};",
+      "lib/orphan.ts": "export const orphan = 1;",
+    });
+
+    await expect(readSourceFiles(directory, "example/files"))
+      .rejects.toThrow("lib/orphan.ts has no client.ts or server.ts to bundle it");
+  });
+
+  it("rejects imports that reach outside the blueprint", async () => {
+    // A per-test parent, so the out-of-tree file is private to this run rather than a fixed path
+    // in the shared tmpdir root that a concurrent run would race on.
+    let parent = await mkdtemp(join(tmpdir(), "format-blueprint-outside-"));
+    temporaryDirectories.push(parent);
+    let directory = join(parent, "files");
+    await mkdir(directory);
+    await writeFile(join(directory, "client.ts"),
+        'import { secret } from "../outside.ts"; console.log(secret);');
+    await writeFile(join(parent, "outside.ts"), "export const secret = 1;");
+
+    await expect(readSourceFiles(directory, "example/files"))
+      .rejects.toThrow("client.ts imports ../outside.ts, which is outside the blueprint's files");
+  });
+
+  it("reports an unresolvable import against the entry", async () => {
+    let directory = await sourceTree({
+      "server.ts": 'import { missing } from "./lib/missing.ts"; export default missing;',
+    });
+
+    await expect(readSourceFiles(directory, "example/files"))
+      .rejects.toThrow(/example\/files: server\.ts failed to bundle: .*lib\/missing/su);
+  });
+});
+
+// A blueprint written in JavaScript is checked without bundling, so every case here but the
+// bundled ones runs in both environments.
+describe("format blueprint library pins", () => {
+  const PAGE_PINS = '{"libraries": {"page": "latest"}}\n';
+
+  it("passes a JavaScript blueprint whose imports and pins agree", async () => {
+    let directory = await sourceTree({
+      "client.js": 'import { mount } from "gadgets:page/client";\nmount(document.body);\n',
+      "server.js": 'export { Gadget } from "gadgets:page/server";\n',
+      "gadget.json": PAGE_PINS,
+    });
+
+    expect(await readSourceFiles(directory, "example/files")).toEqual(new Map([
+      ["client.js", 'import { mount } from "gadgets:page/client";\nmount(document.body);\n'],
+      ["gadget.json", PAGE_PINS],
+      ["server.js", 'export { Gadget } from "gadgets:page/server";\n'],
     ]));
   });
 
   it("rejects a library import gadget.json does not pin", async () => {
     let directory = await sourceTree({
-      "client.js": 'import { el } from "gadgets:ui/client";\nel("div");\n',
+      "client.js": 'import { mount } from "gadgets:page/client";\nmount(document.body);\n',
     });
 
     await expect(readSourceFiles(directory, "example/files")).rejects
-      .toThrow("example/files: client.js imports gadgets:ui/client, which gadget.json does " +
+      .toThrow("example/files: client.js imports gadgets:page/client, which gadget.json does " +
           "not pin");
   });
 
   it("names the module that wrote an unpinned import, not just the entry", async () => {
     let directory = await sourceTree({
       "client.js": 'import { mount } from "./lib/mount.js";\nmount();\n',
-      "lib/mount.js": 'export { el as mount } from "gadgets:ui/client";\n',
+      "lib/mount.js": 'export { mount } from "gadgets:page/client";\n',
     });
 
     await expect(readSourceFiles(directory, "example/files")).rejects
-      .toThrow("lib/mount.js imports gadgets:ui/client, which gadget.json does not pin");
+      .toThrow("lib/mount.js imports gadgets:page/client, which gadget.json does not pin");
   });
 
-  it("scans specifiers as text, comments included", async () => {
+  it("scans specifiers the way the lib reachability scan does, comments included", async () => {
     let directory = await sourceTree({
-      "client.js": '// TODO: import { el } from "gadgets:ui/client";\nexport {};\n',
+      "client.js": '// TODO: import { mount } from "gadgets:page/client";\nexport {};\n',
     });
 
     await expect(readSourceFiles(directory, "example/files")).rejects
-      .toThrow("client.js imports gadgets:ui/client, which gadget.json does not pin");
+      .toThrow("client.js imports gadgets:page/client, which gadget.json does not pin");
   });
 
   it("ignores a library import in a file no entry reaches", async () => {
     let directory = await sourceTree({
       "client.js": "export {};\n",
-      "notes/scratch.js": 'import { el } from "gadgets:ui/client";\n',
+      "notes/scratch.js": 'import { mount } from "gadgets:page/client";\n',
     });
 
     expect([...(await readSourceFiles(directory, "example/files")).keys()])
@@ -243,22 +451,22 @@ describe("format blueprint library pins", () => {
   it("rejects a pin nothing imports", async () => {
     let directory = await sourceTree({
       "client.js": "export {};\n",
-      "gadget.json": SYNC_PINS,
+      "gadget.json": PAGE_PINS,
     });
 
     await expect(readSourceFiles(directory, "example/files"))
-      .rejects.toThrow("example/files: gadget.json pins sync, which nothing imports");
+      .rejects.toThrow("example/files: gadget.json pins page, which nothing imports");
   });
 
   it("rejects a pin only a file no entry reaches imports", async () => {
     let directory = await sourceTree({
       "client.js": "export {};\n",
-      "notes/scratch.js": 'import { SaveScheduler } from "gadgets:sync/client";\n',
-      "gadget.json": SYNC_PINS,
+      "notes/scratch.js": 'import { mount } from "gadgets:page/client";\n',
+      "gadget.json": PAGE_PINS,
     });
 
     await expect(readSourceFiles(directory, "example/files"))
-      .rejects.toThrow("gadget.json pins sync, which nothing imports");
+      .rejects.toThrow("gadget.json pins page, which nothing imports");
   });
 
   it.each([
@@ -266,21 +474,21 @@ describe("format blueprint library pins", () => {
     ["server", "client"],
   ] as const)("rejects %s.js importing a library's %s side", async (entry, side) => {
     let directory = await sourceTree({
-      [`${entry}.js`]: `import * as sync from "gadgets:sync/${side}";\nexport default sync;\n`,
-      "gadget.json": SYNC_PINS,
+      [`${entry}.js`]: `import * as page from "gadgets:page/${side}";\nexport default page;\n`,
+      "gadget.json": PAGE_PINS,
     });
 
     await expect(readSourceFiles(directory, "example/files")).rejects
-      .toThrow(`example/files: ${entry}.js imports gadgets:sync/${side} from the ${entry} side`);
+      .toThrow(`example/files: ${entry}.js imports gadgets:page/${side} from the ${entry} side`);
   });
 
   it("checks each side's imports from its own entry", async () => {
     // The same library, imported by both entries: each side is walked from its own entry, so
     // neither import is mistaken for the other side's.
     let directory = await sourceTree({
-      "client.js": 'import "gadgets:sync/client";\n',
-      "server.js": 'import "gadgets:sync/server";\n',
-      "gadget.json": SYNC_PINS,
+      "client.js": 'import "gadgets:page/client";\n',
+      "server.js": 'import "gadgets:page/server";\n',
+      "gadget.json": PAGE_PINS,
     });
 
     expect((await readSourceFiles(directory, "example/files")).size).toBe(3);
@@ -293,14 +501,14 @@ describe("format blueprint library pins", () => {
     };
 
     await expect(readSourceFiles(await sourceTree(files), "example/files",
-        {libraries: new Map([["sync", []]])})).rejects
+        {libraries: new Map([["page", []]])})).rejects
       .toThrow("example/files: client.js imports gadgets:other/client, but the deployment " +
           "bundles no library named other");
     // Without the set -- the archive tests, an importer that only needs the files -- names are
     // taken on trust.
     expect((await readSourceFiles(await sourceTree(files), "example/files")).size).toBe(2);
     expect((await readSourceFiles(await sourceTree(files), "example/files",
-        {libraries: new Map([["other", []], ["sync", []]])})).size).toBe(2);
+        {libraries: new Map([["other", []], ["page", []]])})).size).toBe(2);
   });
 
   it("demands the pins of what an imported library imports in turn", async () => {
@@ -319,22 +527,30 @@ describe("format blueprint library pins", () => {
     expect(output.has("gadget.json")).toBe(true);
   });
 
+  it("rejects a pin to anything but latest", async () => {
+    let directory = await sourceTree({
+      "client.js": 'import { mount } from "gadgets:page/client";\nmount();\n',
+      "gadget.json": '{"libraries": {"page": "vendored"}}\n',
+    });
+
+    await expect(readSourceFiles(directory, "example/files")).rejects
+      .toThrow('example/files: gadget.json: libraries.page must be "latest"');
+  });
+
   it.each([
     ["not JSON", "{libraries: {}}", /gadget\.json: not valid JSON \(/u],
     ["an array", "[]", "gadget.json: must be an object"],
-    ["an unknown key", '{"libraries": {"sync": "latest"}, "version": 1}',
+    ["an unknown key", '{"libraries": {"page": "latest"}, "version": 1}',
       "gadget.json: unknown keys: version"],
-    ["a libraries list", '{"libraries": ["sync"]}',
+    ["a libraries list", '{"libraries": ["page"]}',
       "gadget.json: libraries must be an object of library name to pin"],
-    ["a bad pin", '{"libraries": {"sync": "1.0.0"}}',
-      'gadget.json: libraries.sync must be "latest"'],
-    ["a vendored pin", '{"libraries": {"sync": "vendored"}}',
-      'gadget.json: libraries.sync must be "latest"'],
-    ["a bad library name", '{"libraries": {"Sync": "latest"}}',
-      'gadget.json: "Sync" is not a library name ([a-z][a-z0-9-]*)'],
+    ["a bad pin", '{"libraries": {"page": "1.0.0"}}',
+      'gadget.json: libraries.page must be "latest"'],
+    ["a bad library name", '{"libraries": {"Page": "latest"}}',
+      'gadget.json: "Page" is not a library name ([a-z][a-z0-9-]*)'],
   ])("rejects a gadget.json that is %s", async (_case, text, message) => {
     let directory = await sourceTree({
-      "client.js": 'import { SaveScheduler } from "gadgets:sync/client";\nvoid SaveScheduler;\n',
+      "client.js": 'import { mount } from "gadgets:page/client";\nmount();\n',
       "gadget.json": text,
     });
 
@@ -342,31 +558,77 @@ describe("format blueprint library pins", () => {
     await expect(readSourceFiles(directory, "example/files")).rejects.toThrow(/^example\/files: /u);
   });
 
-  it.each(["gadgets:sync", "gadgets:sync/lib", "gadgets:sync/client/index.js",
-    "gadgets:Sync/client", "gadgets:/client"])(
+  it.each(["gadgets:page", "gadgets:page/lib", "gadgets:page/client/index.js",
+    "gadgets:Page/client", "gadgets:/client"])(
     "rejects %s, which is not a library specifier", async specifier => {
       let directory = await sourceTree({
-        "client.js": `import * as sync from "${specifier}";\nexport default sync;\n`,
-        "gadget.json": SYNC_PINS,
+        "client.js": `import * as page from "${specifier}";\nexport default page;\n`,
+        "gadget.json": PAGE_PINS,
       });
 
       await expect(readSourceFiles(directory, "example/files")).rejects
         .toThrow(`example/files: client.js imports ${specifier}, which is not a library ` +
             "(gadgets:<name>/client or gadgets:<name>/server)");
     });
+
+  describe.skipIf(inWorkerd)("bundled from TypeScript", () => {
+    it("leaves pinned library imports in the bundles and gadget.json as written", async () => {
+      let directory = await sourceTree({
+        "client.ts": [
+          'import { mount, type Options } from "gadgets:page/client";',
+          'const options: Options = {readOnly: false};',
+          "mount(document.body, options);",
+        ].join("\n"),
+        "server.ts": 'export { Gadget } from "gadgets:page/server";',
+        "gadget.json": PAGE_PINS,
+      });
+
+      let files = await readSourceFiles(directory, "example/files");
+
+      expect([...files.keys()]).toEqual(["client.js", "gadget.json", "server.js"]);
+      let client = files.get("client.js")!;
+      expect(client).toMatch(/import \{\s*mount\s*\} from "gadgets:page\/client";/u);
+      expect(client).toContain("mount(document.body, options)");
+      expect(client).not.toContain("Options");
+      expect(files.get("server.js")).toMatch(/from "gadgets:page\/server";/u);
+      expect(files.get("gadget.json")).toBe(PAGE_PINS);
+    });
+
+    it("checks the bundle, so a lib module's library import is the entry's", async () => {
+      let directory = await sourceTree({
+        "client.ts": 'import { mount } from "./lib/mount.ts";\nmount();',
+        "lib/mount.ts": 'export { mount } from "gadgets:page/client";',
+      });
+
+      await expect(readSourceFiles(directory, "example/files")).rejects
+        .toThrow("example/files: client.js imports gadgets:page/client, which gadget.json does " +
+            "not pin");
+    });
+
+    it("rejects a wrong-side import reached through a lib module", async () => {
+      let directory = await sourceTree({
+        "client.ts": 'import { Gadget } from "./lib/server.ts";\nconsole.log(Gadget);',
+        "lib/server.ts": 'export { Gadget } from "gadgets:page/server";',
+        "gadget.json": PAGE_PINS,
+      });
+
+      await expect(readSourceFiles(directory, "example/files")).rejects
+        .toThrow("client.js imports gadgets:page/server from the client side");
+    });
+  });
 });
 
 describe("gadget library grammar", () => {
   it("spells and parses a library specifier", () => {
-    expect(librarySpecifier("sync", "client")).toBe("gadgets:sync/client");
-    expect(parseLibrarySpecifier("gadgets:sync/client")).toEqual({name: "sync", side: "client"});
+    expect(librarySpecifier("page", "client")).toBe("gadgets:page/client");
+    expect(parseLibrarySpecifier("gadgets:page/client")).toEqual({name: "page", side: "client"});
     expect(parseLibrarySpecifier("gadgets:my-lib2/server"))
       .toEqual({name: "my-lib2", side: "server"});
   });
 
-  it.each(["gadgets:sync", "gadgets:sync/lib", "gadgets:sync/client/", "gadgets:a/b/client",
-    "gadgets:Sync/client", "gadgets:2sync/client", "gadgets:-sync/client", "gadgets:/client",
-    "gadgets:sync/CLIENT", " gadgets:sync/client", "gadget:sync/client", "./gadgets:sync/client",
+  it.each(["gadgets:page", "gadgets:page/lib", "gadgets:page/client/", "gadgets:a/b/client",
+    "gadgets:Page/client", "gadgets:2page/client", "gadgets:-page/client", "gadgets:/client",
+    "gadgets:page/CLIENT", " gadgets:page/client", "gadget:page/client", "./gadgets:page/client",
     ""])("parses %j as no library specifier", specifier => {
     expect(parseLibrarySpecifier(specifier)).toBeNull();
   });
@@ -378,8 +640,8 @@ describe("gadget library grammar", () => {
   });
 
   it("reads pins through the file map", () => {
-    expect(readPins(new Map([["gadget.json", '{"libraries": {"sync": "latest"}}']])))
-      .toEqual(new Map([["sync", "latest"]]));
+    expect(readPins(new Map([["gadget.json", '{"libraries": {"page": "latest"}}']])))
+      .toEqual(new Map([["page", "latest"]]));
   });
 
   it("formats pins sorted, in the shape the repo's blueprints commit", () => {
@@ -401,13 +663,13 @@ describe("gadget library grammar", () => {
   it.each([
     ["{libraries: {}}", /^gadget\.json: not valid JSON \(/u],
     ["null", "gadget.json: must be an object"],
-    ['"sync"', "gadget.json: must be an object"],
+    ['"page"', "gadget.json: must be an object"],
     ["[]", "gadget.json: must be an object"],
     ['{"pins": {}}', "gadget.json: unknown keys: pins"],
     ['{"libraries": null}', "gadget.json: libraries must be an object of library name to pin"],
-    ['{"libraries": "sync"}', "gadget.json: libraries must be an object of library name to pin"],
-    ['{"libraries": {"sync": "Latest"}}', 'gadget.json: libraries.sync must be "latest"'],
-    ['{"libraries": {"sync": true}}', 'gadget.json: libraries.sync must be "latest"'],
+    ['{"libraries": "page"}', "gadget.json: libraries must be an object of library name to pin"],
+    ['{"libraries": {"page": "Latest"}}', 'gadget.json: libraries.page must be "latest"'],
+    ['{"libraries": {"page": true}}', 'gadget.json: libraries.page must be "latest"'],
     ['{"libraries": {"my lib": "latest"}}',
       'gadget.json: "my lib" is not a library name ([a-z][a-z0-9-]*)'],
     ['{"libraries": {"": "latest"}}', 'gadget.json: "" is not a library name ([a-z][a-z0-9-]*)'],

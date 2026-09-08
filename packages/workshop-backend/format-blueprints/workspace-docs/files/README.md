@@ -21,6 +21,10 @@ ships (see `packages/gadget-libraries/README.md`).
 Everything on top of them is this gadget's own: the editing commands, the paste sanitizer, the block
 model and its ordering rule, where a remote caret is drawn, and the export formats.
 
+In the repository the source is TypeScript under `format-blueprints/workspace-docs/files/` (`client.ts`,
+`server.ts` and the shared `lib/protocol.ts` contract), which the build bundles into the `client.js` and
+`server.js` this gadget runs.
+
 ## Architecture
 
 - **server.js** is the authoritative collaboration coordinator. It stores one atomic `document:v2` snapshot containing the title, global revision, ordered blocks, per-block versions, and modification time.

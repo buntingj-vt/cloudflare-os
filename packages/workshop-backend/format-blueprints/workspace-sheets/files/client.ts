@@ -20,10 +20,35 @@ import {
 import {
   PresenceReporter,
   PresenceRoster,
+  type SaveOutcome,
   SaveScheduler,
+  type SyncHost,
   collaboratorFor,
   createSubscriber,
 } from "gadgets:sync/client";
+import type { SelectOption } from "gadgets:ui/client";
+import type {
+  Cell,
+  CellFmt,
+  CellMap,
+  CellOp,
+  Dims,
+  GadgetStub,
+  OperationEvent,
+  PresenceUpdate,
+  SelectionCursor,
+  SheetMeta,
+  SheetsDocument,
+  SheetsPresenceEvent,
+  Structure,
+  StructureUpdate,
+  SubscriberEvent,
+} from "./lib/protocol.ts";
+
+// The bindings the Workshop's iframe bootstrap defines before this module runs: the RPC stub to
+// this gadget's Durable Object, and Cap'n Web's RpcTarget for the callbacks it is handed.
+declare const gadget: GadgetStub;
+declare const RpcTarget: SyncHost["RpcTarget"];
 
 const clientId = Math.random().toString(36).slice(2);
 // This tab's guest identity, as the server repeats it to everyone else.
@@ -308,20 +333,33 @@ const ICONS = {
   plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
 };
 
+// A zero-based grid position.
+interface RC {
+  r: number;
+  c: number;
+}
+// A zero-based, inclusive rectangle of cells.
+interface Range {
+  r1: number;
+  c1: number;
+  r2: number;
+  c2: number;
+}
+
 // A1 <-> (row, col) — both zero-based internally.
-function colToLetter(c) {
+function colToLetter(c: number): string {
   let s = "";
   c += 1;
   while (c > 0) { const m = (c - 1) % 26; s = String.fromCharCode(65 + m) + s; c = Math.floor((c - 1) / 26); }
   return s;
 }
-function letterToCol(s) {
+function letterToCol(s: string): number {
   let c = 0;
   for (const ch of s.toUpperCase()) c = c * 26 + (ch.charCodeAt(0) - 64);
   return c - 1;
 }
-function rcToRef(r, c) { return colToLetter(c) + (r + 1); }
-function parseRef(ref) {
+function rcToRef(r: number, c: number): string { return colToLetter(c) + (r + 1); }
+function parseRef(ref: string): RC | null {
   const m = /^\$?([A-Za-z]+)\$?(\d+)$/.exec(ref);
   if (!m) return null;
   return { r: parseInt(m[2], 10) - 1, c: letterToCol(m[1]) };
@@ -330,8 +368,27 @@ function parseRef(ref) {
 // ===========================================================================
 // Formula engine — tokenizer, Pratt parser, evaluator, function library.
 // ===========================================================================
+// A scalar a cell or a formula may hold; `undefined` is what a function that returns nothing
+// yields before `callFn` maps it to `null`.
+type Scalar = number | string | boolean | null | undefined;
+// A range as the evaluator hands it to functions: its extent and a lazy cell accessor.
+interface Matrix {
+  matrix: true;
+  sheetId?: string;
+  r1?: number;
+  c1?: number;
+  r2?: number;
+  c2?: number;
+  rows: number;
+  cols: number;
+  get(i: number, j: number): Value;
+}
+// Anything an expression evaluates to.
+type Value = Scalar | CellError | Matrix;
+
 class CellError {
-  constructor(v) { this.value = v; }
+  declare value: string;
+  constructor(v: string) { this.value = v; }
   toString() { return this.value; }
 }
 const ERR = {
@@ -343,11 +400,17 @@ const ERR = {
   NUM: () => new CellError("#NUM!"),
   CYCLE: () => new CellError("#CYCLE!"),
 };
-const isErr = (v) => v instanceof CellError;
+const isErr = (v: unknown): v is CellError => v instanceof CellError;
+const isMatrix = (v: Value): v is Matrix => typeof v === "object" && v !== null && "matrix" in v;
 
 // --- Tokenizer ---
-function tokenize(src) {
-  const tokens = [];
+type Token =
+  | { t: "str" | "op" | "word"; v: string }
+  | { t: "num"; v: number }
+  | { t: "lp" | "rp" | "comma" | "colon"; v?: undefined };
+
+function tokenize(src: string): Token[] {
+  const tokens: Token[] = [];
   let i = 0;
   const n = src.length;
   while (i < n) {
@@ -393,13 +456,24 @@ function tokenize(src) {
 }
 
 // --- Parser (produces AST) ---
-function parseFormula(src) {
+type Ast =
+  | { k: "num"; v: number }
+  | { k: "str"; v: string }
+  | { k: "bool"; v: boolean }
+  | { k: "ref"; ref: string }
+  | { k: "range"; a: string; b: string }
+  | { k: "un"; op: string; a: Ast }
+  | { k: "pct"; a: Ast }
+  | { k: "bin"; op: string; a: Ast; b: Ast }
+  | { k: "call"; name: string; args: Ast[] };
+
+function parseFormula(src: string): Ast {
   const tokens = tokenize(src);
   let pos = 0;
-  const peek = () => tokens[pos];
-  const next = () => tokens[pos++];
+  const peek = (): Token | undefined => tokens[pos];
+  const next = (): Token | undefined => tokens[pos++];
 
-  function parseExpr(minbp = 0) {
+  function parseExpr(minbp = 0): Ast {
     let left = parseUnary();
     while (true) {
       const tk = peek();
@@ -412,37 +486,39 @@ function parseFormula(src) {
     }
     return left;
   }
-  function parseUnary() {
+  function parseUnary(): Ast {
     const tk = peek();
     if (tk && tk.t === "op" && (tk.v === "-" || tk.v === "+")) { next(); return { k: "un", op: tk.v, a: parseUnary() }; }
     let node = parsePrimary();
     // postfix percent
-    while (peek() && peek().t === "op" && peek().v === "%") { next(); node = { k: "pct", a: node }; }
+    while (peek() && peek()!.t === "op" && peek()!.v === "%") { next(); node = { k: "pct", a: node }; }
     return node;
   }
-  function parsePrimary() {
+  function parsePrimary(): Ast {
     const tk = next();
     if (!tk) throw ERR.VALUE();
     if (tk.t === "num") return { k: "num", v: tk.v };
     if (tk.t === "str") return { k: "str", v: tk.v };
-    if (tk.t === "lp") { const e = parseExpr(0); if (peek() && peek().t === "rp") next(); return e; }
+    if (tk.t === "lp") { const e = parseExpr(0); if (peek() && peek()!.t === "rp") next(); return e; }
     if (tk.t === "word") {
-      if (peek() && peek().t === "lp") {
+      if (peek() && peek()!.t === "lp") {
         next();
-        const args = [];
-        if (!(peek() && peek().t === "rp")) {
+        const args: Ast[] = [];
+        if (!(peek() && peek()!.t === "rp")) {
           args.push(parseExpr(0));
-          while (peek() && peek().t === "comma") { next(); args.push(parseExpr(0)); }
+          while (peek() && peek()!.t === "comma") { next(); args.push(parseExpr(0)); }
         }
-        if (peek() && peek().t === "rp") next();
+        if (peek() && peek()!.t === "rp") next();
         return { k: "call", name: tk.v.toUpperCase(), args };
       }
       const up = tk.v.toUpperCase();
       if (up === "TRUE") return { k: "bool", v: true };
       if (up === "FALSE") return { k: "bool", v: false };
       // reference — possibly a range with colon
-      let ref = { k: "ref", ref: tk.v };
-      if (peek() && peek().t === "colon") { next(); const r2 = next(); ref = { k: "range", a: tk.v, b: r2 ? r2.v : "" }; }
+      let ref: Ast = { k: "ref", ref: tk.v };
+      // TODO(types): the token after the colon is taken as-is, so `A1:5` or `A1:(` stores a number
+      // or `undefined` as the range end; evaluation then fails with #VALUE!, as it always has.
+      if (peek() && peek()!.t === "colon") { next(); const r2 = next(); ref = { k: "range", a: tk.v, b: r2 ? (r2.v as string) : "" }; }
       return ref;
     }
     throw ERR.VALUE();
@@ -450,7 +526,7 @@ function parseFormula(src) {
   const ast = parseExpr(0);
   return ast;
 }
-const BP = {
+const BP: Record<string, { lbp: number; right?: boolean }> = {
   "=": { lbp: 1 }, "<>": { lbp: 1 }, "<": { lbp: 1 }, ">": { lbp: 1 }, "<=": { lbp: 1 }, ">=": { lbp: 1 },
   "&": { lbp: 2 },
   "+": { lbp: 3 }, "-": { lbp: 3 },
@@ -459,7 +535,7 @@ const BP = {
 };
 
 // --- Serializer (AST -> string), used for ref adjustment on insert/delete ---
-function serializeAst(node) {
+function serializeAst(node: Ast): string {
   switch (node.k) {
     case "num": return String(node.v);
     case "str": return '"' + node.v.replace(/"/g, '""') + '"';
@@ -478,10 +554,10 @@ function serializeAst(node) {
 // Number coercion + formatting
 // ===========================================================================
 const DATE_EPOCH = Date.UTC(1899, 11, 30);
-function serialToDate(s) { return new Date(DATE_EPOCH + Math.round(s * 86400000)); }
-function dateToSerial(d) { return (d.getTime() - DATE_EPOCH) / 86400000; }
+function serialToDate(s: number): Date { return new Date(DATE_EPOCH + Math.round(s * 86400000)); }
+function dateToSerial(d: Date): number { return (d.getTime() - DATE_EPOCH) / 86400000; }
 
-function toNum(v) {
+function toNum(v: Value): number {
   if (isErr(v)) throw v;
   if (v == null || v === "") return 0;
   if (typeof v === "number") return v;
@@ -492,13 +568,13 @@ function toNum(v) {
   if (!Number.isFinite(n)) throw ERR.VALUE();
   return s.endsWith("%") ? n / 100 : n;
 }
-function toStr(v) {
+function toStr(v: Value): string {
   if (isErr(v)) throw v;
   if (v == null) return "";
   if (typeof v === "boolean") return v ? "TRUE" : "FALSE";
   return String(v);
 }
-function toBool(v) {
+function toBool(v: Value): boolean {
   if (isErr(v)) throw v;
   if (typeof v === "boolean") return v;
   if (typeof v === "number") return v !== 0;
@@ -509,12 +585,12 @@ function toBool(v) {
   return toNum(v) !== 0;
 }
 
-function fmtNumber(n, decimals, thousands) {
-  const opts = { minimumFractionDigits: decimals, maximumFractionDigits: decimals };
+function fmtNumber(n: number, decimals: number, thousands: boolean): string {
+  const opts: Intl.NumberFormatOptions = { minimumFractionDigits: decimals, maximumFractionDigits: decimals };
   if (!thousands) opts.useGrouping = false;
   return n.toLocaleString("en-US", opts);
 }
-function fmtGeneral(n) {
+function fmtGeneral(n: number): string {
   if (!Number.isFinite(n)) return n > 0 ? "#NUM!" : "#NUM!";
   if (Number.isInteger(n) && Math.abs(n) < 1e15) return String(n);
   const abs = Math.abs(n);
@@ -523,19 +599,25 @@ function fmtGeneral(n) {
   if (s.includes(".")) s = s.replace(/0+$/, "").replace(/\.$/, "");
   return s;
 }
-function pad2(x) { return String(x).padStart(2, "0"); }
-function fmtDate(serial) {
+function pad2(x: number): string { return String(x).padStart(2, "0"); }
+function fmtDate(serial: number): string {
   const d = serialToDate(serial);
   return `${pad2(d.getUTCMonth() + 1)}/${pad2(d.getUTCDate())}/${d.getUTCFullYear()}`;
 }
-function fmtTime(serial) {
+function fmtTime(serial: number): string {
   const d = serialToDate(serial);
   let h = d.getUTCHours(); const ap = h >= 12 ? "PM" : "AM"; h = h % 12 || 12;
   return `${h}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())} ${ap}`;
 }
 
 // Returns { text, numeric, err } for a computed value + format.
-function displayValue(computed, fmt) {
+interface Display {
+  text: string;
+  numeric?: boolean;
+  err?: boolean;
+  center?: boolean;
+}
+function displayValue(computed: Value, fmt: CellFmt | null | undefined): Display {
   if (isErr(computed)) return { text: computed.value, err: true };
   if (computed == null || computed === "") return { text: "" };
   const nf = fmt?.nf;
@@ -543,7 +625,7 @@ function displayValue(computed, fmt) {
   if (typeof computed === "boolean") return { text: computed ? "TRUE" : "FALSE", center: true };
   if (typeof computed === "number") {
     if (!Number.isFinite(computed)) return { text: "#NUM!", err: true };
-    let text;
+    let text: string;
     switch (nf) {
       case "number": text = fmtNumber(computed, d ?? 2, true); break;
       case "integer": text = fmtNumber(Math.round(computed), 0, true); break;
@@ -566,18 +648,55 @@ function displayValue(computed, fmt) {
 // ===========================================================================
 // Evaluation context — resolves refs across sheets with memoization + cycles.
 // ===========================================================================
-// `engine` is rebuilt (cache cleared) whenever the model changes.
-function makeEngine(model) {
-  const cache = new Map(); // "sheetId!REF" -> value
-  const inProgress = new Set();
-  const astCache = new Map(); // formula string -> ast|error
+// The client's copy of the workbook: the document without its modification time.
+type Model = Omit<SheetsDocument, "lastModified">;
+// The cell a formula is evaluated for.
+interface EvalContext {
+  sheetId: string;
+  r: number;
+  c: number;
+}
+// What `makeEngine` returns.
+interface Engine {
+  computeRef(sheetId: string, ref: string): Value;
+}
+// Helpers exposed to builtins (see `H` below).
+interface Helpers {
+  evalNode(node: Ast, ctx: EvalContext): Value;
+  isErr: typeof isErr;
+  ERR: typeof ERR;
+  toNum: typeof toNum;
+  toStr: typeof toStr;
+  toBool: typeof toBool;
+  compare(a: Value, b: Value, op: string): boolean | undefined;
+  serialToDate: typeof serialToDate;
+  dateToSerial: typeof dateToSerial;
+  flatVals(args: Ast[], ctx: EvalContext): Value[];
+  flatNums(args: Ast[], ctx: EvalContext): number[];
+  scalar(node: Ast, ctx: EvalContext): Value;
+  matrixOf(node: Ast, ctx: EvalContext): Matrix;
+}
+// Raw resolvers exposed to builtins (see `callFn` below).
+interface Resolvers {
+  evalCellRef(sheetId: string, r: number, c: number): Value;
+  splitRef(ref: string, defSheet: string): { sheetId: string; r: number; c: number } | null;
+  makeMatrix(sheetId: string, r1: number, c1: number, r2: number, c2: number): Matrix;
+  model: Model;
+}
+type FormulaFn = (args: Ast[], ctx: EvalContext, H: Helpers, R: Resolvers) => Value;
 
-  function sheetByName(name) {
+// `engine` is rebuilt (cache cleared) whenever the model changes.
+function makeEngine(model: Model): Engine {
+  const cache = new Map<string, Value>(); // "sheetId!REF" -> value
+  const inProgress = new Set<string>();
+  const astCache = new Map<string, Ast | CellError>(); // formula string -> ast|error
+
+  function sheetByName(name: string): string | null {
     name = name.replace(/^'|'$/g, "");
     for (const id of model.sheetOrder) if (model.sheets[id].name.toLowerCase() === name.toLowerCase()) return id;
     return null;
   }
-  function splitRef(ref, defSheet) {
+  function splitRef(ref: string, defSheet: string): { sheetId: string; r: number; c: number } | null {
     let sheetId = defSheet;
     let cellPart = ref;
     const bang = ref.indexOf("!");
@@ -592,7 +711,7 @@ function makeEngine(model) {
     return { sheetId, r: rc.r, c: rc.c };
   }
 
-  function rawCellValue(sheetId, r, c) {
+  function rawCellValue(sheetId: string, r: number, c: number): string | null {
     const cells = model.cells[sheetId];
     if (!cells) return null;
     const cell = cells[rcToRef(r, c)];
@@ -600,13 +719,13 @@ function makeEngine(model) {
     return cell.value;
   }
 
-  function evalCellRef(sheetId, r, c) {
+  function evalCellRef(sheetId: string, r: number, c: number): Value {
     const key = sheetId + "!" + rcToRef(r, c);
-    if (cache.has(key)) return cache.get(key);
+    if (cache.has(key)) return cache.get(key)!;
     if (inProgress.has(key)) return ERR.CYCLE();
     const raw = rawCellValue(sheetId, r, c);
     if (raw == null) { cache.set(key, null); return null; }
-    let result;
+    let result: Value;
     if (raw[0] === "=") {
       inProgress.add(key);
       try {
@@ -622,7 +741,7 @@ function makeEngine(model) {
     return result;
   }
 
-  function literalValue(raw) {
+  function literalValue(raw: string): Scalar {
     if (raw[0] === "'") return raw.slice(1);
     const s = raw.trim();
     if (s === "") return "";
@@ -638,13 +757,13 @@ function makeEngine(model) {
   }
 
   // Matrix wrapper for ranges.
-  function makeMatrix(sheetId, r1, c1, r2, c2) {
+  function makeMatrix(sheetId: string, r1: number, c1: number, r2: number, c2: number): Matrix {
     return { matrix: true, sheetId, r1, c1, r2, c2,
       get(i, j) { return evalCellRef(sheetId, r1 + i, c1 + j); },
       rows: r2 - r1 + 1, cols: c2 - c1 + 1 };
   }
 
-  function evalNode(node, ctx) {
+  function evalNode(node: Ast, ctx: EvalContext): Value {
     switch (node.k) {
       case "num": return node.v;
       case "str": return node.v;
@@ -664,7 +783,8 @@ function makeEngine(model) {
       case "un": {
         const v = evalNode(node.a, ctx);
         if (isErr(v)) return v;
-        try { return node.op === "-" ? -toNum(v) : +toNum(v); } catch (e) { return e; }
+        // `toNum` throws only CellErrors.
+        try { return node.op === "-" ? -toNum(v) : +toNum(v); } catch (e) { return e as CellError; }
       }
       case "bin": return evalBin(node, ctx);
       case "call": return callFn(node, ctx);
@@ -672,11 +792,11 @@ function makeEngine(model) {
     return ERR.VALUE();
   }
 
-  function evalBin(node, ctx) {
+  function evalBin(node: Extract<Ast, { k: "bin" }>, ctx: EvalContext): Value {
     const op = node.op;
     let a = evalNode(node.a, ctx), b = evalNode(node.b, ctx);
-    if (a && a.matrix) a = a.get(0, 0);
-    if (b && b.matrix) b = b.get(0, 0);
+    if (isMatrix(a)) a = a.get(0, 0);
+    if (isMatrix(b)) b = b.get(0, 0);
     if (isErr(a)) return a;
     if (isErr(b)) return b;
     try {
@@ -694,9 +814,9 @@ function makeEngine(model) {
     return ERR.VALUE();
   }
 
-  function compare(a, b, op) {
+  function compare(a: Value, b: Value, op: string): boolean | undefined {
     let x = a == null ? "" : a, y = b == null ? "" : b;
-    let cmp;
+    let cmp: number;
     if (typeof x === "number" && typeof y === "number") cmp = x - y;
     else if (typeof x === "boolean" || typeof y === "boolean") cmp = (toNum(x) ? 1 : 0) - (toNum(y) ? 1 : 0);
     else cmp = String(x).toLowerCase() < String(y).toLowerCase() ? -1 : String(x).toLowerCase() > String(y).toLowerCase() ? 1 : 0;
@@ -711,32 +831,32 @@ function makeEngine(model) {
   }
 
   // Helpers exposed to builtins.
-  const H = {
+  const H: Helpers = {
     evalNode, isErr, ERR, toNum, toStr, toBool, compare, serialToDate, dateToSerial,
     // flat list of scalar values from arg nodes (ranges expanded)
     flatVals(args, ctx) {
-      const out = [];
+      const out: Value[] = [];
       for (const node of args) collectVals(evalNode(node, ctx), out);
       return out;
     },
     // flat list of numbers, ignoring blanks & non-numeric text (aggregation style)
     flatNums(args, ctx) {
-      const out = [];
+      const out: number[] = [];
       for (const node of args) {
         const v = evalNode(node, ctx);
         collectNums(v, out);
       }
       return out;
     },
-    scalar(node, ctx) { let v = evalNode(node, ctx); if (v && v.matrix) v = v.get(0, 0); return v; },
-    matrixOf(node, ctx) { const v = evalNode(node, ctx); return v && v.matrix ? v : { matrix: true, rows: 1, cols: 1, get: () => v }; },
+    scalar(node, ctx) { let v = evalNode(node, ctx); if (isMatrix(v)) v = v.get(0, 0); return v; },
+    matrixOf(node, ctx) { const v = evalNode(node, ctx); return isMatrix(v) ? v : { matrix: true, rows: 1, cols: 1, get: () => v }; },
   };
-  function collectVals(v, out) {
-    if (v && v.matrix) { for (let i = 0; i < v.rows; i++) for (let j = 0; j < v.cols; j++) out.push(v.get(i, j)); }
+  function collectVals(v: Value, out: Value[]): void {
+    if (isMatrix(v)) { for (let i = 0; i < v.rows; i++) for (let j = 0; j < v.cols; j++) out.push(v.get(i, j)); }
     else out.push(v);
   }
-  function collectNums(v, out) {
-    if (v && v.matrix) {
+  function collectNums(v: Value, out: number[]): void {
+    if (isMatrix(v)) {
       for (let i = 0; i < v.rows; i++) for (let j = 0; j < v.cols; j++) {
         const c = v.get(i, j);
         if (isErr(c)) throw c;
@@ -751,7 +871,7 @@ function makeEngine(model) {
     }
   }
 
-  function callFn(node, ctx) {
+  function callFn(node: Extract<Ast, { k: "call" }>, ctx: EvalContext): Value {
     const fn = FUNCTIONS[node.name];
     if (!fn) return ERR.NAME();
     try {
@@ -761,19 +881,19 @@ function makeEngine(model) {
   }
 
   return {
-    computeRef(sheetId, ref) { const rc = parseRef(ref); return rc ? evalCellRef(sheetId, rc.r, rc.c) : ERR.REF(); },
+    computeRef(sheetId: string, ref: string) { const rc = parseRef(ref); return rc ? evalCellRef(sheetId, rc.r, rc.c) : ERR.REF(); },
   };
 }
-function divSafe(a, b) { return b === 0 ? ERR.DIV0() : a / b; }
+function divSafe(a: number, b: number): number | CellError { return b === 0 ? ERR.DIV0() : a / b; }
 
 // ===========================================================================
 // Function library (70+ functions). Signature: (args, ctx, H, R) -> value
 // H = helpers, R = raw resolvers { evalCellRef, splitRef, makeMatrix, model }
 // ===========================================================================
-const FUNCTIONS = (() => {
-  const F = {};
-  const numArgs = (args, ctx, H) => H.flatNums(args, ctx);
-  const s = (args, ctx, H, i) => H.scalar(args[i], ctx);
+const FUNCTIONS: Record<string, FormulaFn> = (() => {
+  const F: Record<string, FormulaFn> = {};
+  const numArgs = (args: Ast[], ctx: EvalContext, H: Helpers) => H.flatNums(args, ctx);
+  const s = (args: Ast[], ctx: EvalContext, H: Helpers, i: number) => H.scalar(args[i], ctx);
 
   // ---- Math / aggregation ----
   F.SUM = (a, c, H) => numArgs(a, c, H).reduce((x, y) => x + y, 0);
@@ -787,7 +907,7 @@ const FUNCTIONS = (() => {
   F.MAX = (a, c, H) => { const n = numArgs(a, c, H); return n.length ? Math.max(...n) : 0; };
   F.MIN = (a, c, H) => { const n = numArgs(a, c, H); return n.length ? Math.min(...n) : 0; };
   F.MEDIAN = (a, c, H) => { const n = numArgs(a, c, H).sort((x, y) => x - y); if (!n.length) return ERR.NUM(); const m = n.length >> 1; return n.length % 2 ? n[m] : (n[m - 1] + n[m]) / 2; };
-  F.MODE = (a, c, H) => { const n = numArgs(a, c, H); const m = {}; let best = null, bc = 0; for (const x of n) { m[x] = (m[x] || 0) + 1; if (m[x] > bc) { bc = m[x]; best = x; } } return bc > 1 ? best : ERR.NA(); };
+  F.MODE = (a, c, H) => { const n = numArgs(a, c, H); const m: Record<number, number> = {}; let best: number | null = null, bc = 0; for (const x of n) { m[x] = (m[x] || 0) + 1; if (m[x] > bc) { bc = m[x]; best = x; } } return bc > 1 ? best : ERR.NA(); };
   F.ABS = (a, c, H) => Math.abs(H.toNum(s(a, c, H, 0)));
   F.SIGN = (a, c, H) => Math.sign(H.toNum(s(a, c, H, 0)));
   F.SQRT = (a, c, H) => { const x = H.toNum(s(a, c, H, 0)); return x < 0 ? ERR.NUM() : Math.sqrt(x); };
@@ -809,16 +929,16 @@ const FUNCTIONS = (() => {
   F.SQRTPI = (a, c, H) => Math.sqrt(H.toNum(s(a, c, H, 0)) * Math.PI);
   F.RAND = () => Math.random();
   F.RANDBETWEEN = (a, c, H) => { const lo = Math.ceil(H.toNum(s(a, c, H, 0))); const hi = Math.floor(H.toNum(s(a, c, H, 1))); return lo + Math.floor(Math.random() * (hi - lo + 1)); };
-  F.GCD = (a, c, H) => { const n = numArgs(a, c, H).map((x) => Math.abs(Math.trunc(x))); const g = (x, y) => y ? g(y, x % y) : x; return n.reduce((x, y) => g(x, y), 0); };
-  F.LCM = (a, c, H) => { const n = numArgs(a, c, H).map((x) => Math.abs(Math.trunc(x))); const g = (x, y) => y ? g(y, x % y) : x; return n.reduce((x, y) => (x && y ? x * y / g(x, y) : 0), 1); };
+  F.GCD = (a, c, H) => { const n = numArgs(a, c, H).map((x) => Math.abs(Math.trunc(x))); const g = (x: number, y: number): number => y ? g(y, x % y) : x; return n.reduce((x, y) => g(x, y), 0); };
+  F.LCM = (a, c, H) => { const n = numArgs(a, c, H).map((x) => Math.abs(Math.trunc(x))); const g = (x: number, y: number): number => y ? g(y, x % y) : x; return n.reduce((x, y) => (x && y ? x * y / g(x, y) : 0), 1); };
   F.FACT = (a, c, H) => { let x = Math.floor(H.toNum(s(a, c, H, 0))); if (x < 0) return ERR.NUM(); let r = 1; for (let i = 2; i <= x; i++) r *= i; return r; };
   F.RADIANS = (a, c, H) => H.toNum(s(a, c, H, 0)) * Math.PI / 180;
   F.DEGREES = (a, c, H) => H.toNum(s(a, c, H, 0)) * 180 / Math.PI;
-  for (const fn of ["SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "SINH", "COSH", "TANH"]) F[fn] = (a, c, H) => Math[fn.toLowerCase()](H.toNum(s(a, c, H, 0)));
+  for (const fn of ["SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "SINH", "COSH", "TANH"] as const) F[fn] = (a, c, H) => Math[fn.toLowerCase() as Lowercase<typeof fn>](H.toNum(s(a, c, H, 0)));
   F.ATAN2 = (a, c, H) => Math.atan2(H.toNum(s(a, c, H, 1)), H.toNum(s(a, c, H, 0)));
 
   // ---- Conditional aggregation ----
-  function matchCriteria(val, crit) {
+  function matchCriteria(val: Value, crit: Value): boolean {
     if (crit == null) return val == null || val === "";
     let c = typeof crit === "string" ? crit : String(crit);
     const m = /^(<=|>=|<>|=|<|>)(.*)$/.exec(c);
@@ -827,7 +947,7 @@ const FUNCTIONS = (() => {
     const rn = Number(rhs);
     const rhsNum = rhs.trim() !== "" && Number.isFinite(rn);
     if (op === "=" || op === "<>") {
-      let eq;
+      let eq: boolean;
       if (rhsNum && typeof val === "number") eq = val === rn;
       else if (/[*?]/.test(rhs)) { const re = wildToRe(rhs); eq = re.test(String(val ?? "")); }
       else eq = String(val ?? "").toLowerCase() === rhs.toLowerCase();
@@ -841,8 +961,8 @@ const FUNCTIONS = (() => {
     }
     return op === "<" ? vn < rn : op === ">" ? vn > rn : op === "<=" ? vn <= rn : vn >= rn;
   }
-  function wildToRe(p) { return new RegExp("^" + p.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i"); }
-  function matVals(m) { const o = []; for (let i = 0; i < m.rows; i++) for (let j = 0; j < m.cols; j++) o.push(m.get(i, j)); return o; }
+  function wildToRe(p: string): RegExp { return new RegExp("^" + p.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i"); }
+  function matVals(m: Matrix): Value[] { const o: Value[] = []; for (let i = 0; i < m.rows; i++) for (let j = 0; j < m.cols; j++) o.push(m.get(i, j)); return o; }
 
   F.SUMIF = (a, c, H) => {
     const range = matVals(H.matrixOf(a[0], c));
@@ -859,18 +979,18 @@ const FUNCTIONS = (() => {
     let t = 0, n = 0; for (let i = 0; i < range.length; i++) if (matchCriteria(range[i], crit)) { const v = avgRange[i]; if (typeof v === "number") { t += v; n++; } }
     return n ? t / n : ERR.DIV0();
   };
-  function ifsMatch(a, c, H, startIdx) {
+  function ifsMatch(a: Ast[], c: EvalContext, H: Helpers, startIdx: number): boolean[] {
     // returns boolean array over first criteria range
-    const pairs = [];
+    const pairs: [Value[], Value][] = [];
     for (let i = startIdx; i + 1 < a.length; i += 2) pairs.push([matVals(H.matrixOf(a[i], c)), H.scalar(a[i + 1], c)]);
     const len = pairs.length ? pairs[0][0].length : 0;
-    const mask = [];
+    const mask: boolean[] = [];
     for (let i = 0; i < len; i++) mask.push(pairs.every(([rng, cr]) => matchCriteria(rng[i], cr)));
     return mask;
   }
-  F.SUMIFS = (a, c, H) => { const sum = matVals(H.matrixOf(a[0], c)); const mask = ifsMatch(a, c, H, 1); let t = 0; for (let i = 0; i < mask.length; i++) if (mask[i] && typeof sum[i] === "number") t += sum[i]; return t; };
+  F.SUMIFS = (a, c, H) => { const sum = matVals(H.matrixOf(a[0], c)); const mask = ifsMatch(a, c, H, 1); let t = 0; for (let i = 0; i < mask.length; i++) if (mask[i] && typeof sum[i] === "number") t += sum[i] as number; return t; };
   F.COUNTIFS = (a, c, H) => ifsMatch(a, c, H, 0).filter(Boolean).length;
-  F.AVERAGEIFS = (a, c, H) => { const avg = matVals(H.matrixOf(a[0], c)); const mask = ifsMatch(a, c, H, 1); let t = 0, n = 0; for (let i = 0; i < mask.length; i++) if (mask[i] && typeof avg[i] === "number") { t += avg[i]; n++; } return n ? t / n : ERR.DIV0(); };
+  F.AVERAGEIFS = (a, c, H) => { const avg = matVals(H.matrixOf(a[0], c)); const mask = ifsMatch(a, c, H, 1); let t = 0, n = 0; for (let i = 0; i < mask.length; i++) if (mask[i] && typeof avg[i] === "number") { t += avg[i] as number; n++; } return n ? t / n : ERR.DIV0(); };
   F.SUMPRODUCT = (a, c, H) => {
     const mats = a.map((nd) => H.matrixOf(nd, c));
     const rows = mats[0].rows, cols = mats[0].cols;
@@ -882,7 +1002,7 @@ const FUNCTIONS = (() => {
   };
 
   // ---- Statistics ----
-  function stdVar(vals, pop, variance) {
+  function stdVar(vals: number[], pop: boolean, variance: boolean): number | CellError {
     if (vals.length < (pop ? 1 : 2)) return ERR.DIV0();
     const mean = vals.reduce((x, y) => x + y, 0) / vals.length;
     const ss = vals.reduce((x, y) => x + (y - mean) ** 2, 0);
@@ -938,20 +1058,20 @@ const FUNCTIONS = (() => {
   F.VALUE = (a, c, H) => H.toNum(H.scalar(a[0], c));
   F.TEXT = (a, c, H) => { const v = H.toNum(H.scalar(a[0], c)); const f = H.toStr(H.scalar(a[1], c)); return applyTextFormat(v, f); };
 
-  function applyTextFormat(v, f) {
+  function applyTextFormat(v: number, f: string): string {
     if (/%/.test(f)) { const dec = (f.split(".")[1] || "").length; return (v * 100).toFixed(dec) + "%"; }
     if (/[$]/.test(f)) { const dec = (f.split(".")[1] || "").replace(/[^0#]/g, "").length; return "$" + v.toLocaleString("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec }); }
     if (/yy|mm|dd|hh/i.test(f)) return formatDatePattern(v, f);
     if (/0|#/.test(f)) { const dec = (f.split(".")[1] || "").replace(/[^0#]/g, "").length; const grp = /[#0],[#0]/.test(f) || /,/.test(f.split(".")[0]); return v.toLocaleString("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec, useGrouping: grp }); }
     return String(v);
   }
-  function formatDatePattern(serial, f) {
+  function formatDatePattern(serial: number, f: string): string {
     const d = serialToDate(serial);
     const M = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
     const D = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
     let h12 = d.getUTCHours() % 12 || 12;
     return f
-      .replace(/yyyy/gi, d.getUTCFullYear())
+      .replace(/yyyy/gi, String(d.getUTCFullYear()))
       .replace(/yy/gi, String(d.getUTCFullYear()).slice(-2))
       .replace(/mmmm/gi, M[d.getUTCMonth()])
       .replace(/mmm/gi, M[d.getUTCMonth()].slice(0, 3))
@@ -1049,11 +1169,11 @@ const FUNCTIONS = (() => {
   F.MINUTE = (a, c, H) => serialToDate(H.toNum(s(a, c, H, 0))).getUTCMinutes();
   F.SECOND = (a, c, H) => serialToDate(H.toNum(s(a, c, H, 0))).getUTCSeconds();
   F.WEEKDAY = (a, c, H) => { const d = serialToDate(H.toNum(s(a, c, H, 0))).getUTCDay(); const type = a.length > 1 ? H.toNum(s(a, c, H, 1)) : 1; if (type === 2) return d === 0 ? 7 : d; if (type === 3) return (d + 6) % 7; return d + 1; };
-  F.WEEKNUM = (a, c, H) => { const d = serialToDate(H.toNum(s(a, c, H, 0))); const start = Date.UTC(d.getUTCFullYear(), 0, 1); return Math.floor(((d - start) / 86400000 + new Date(start).getUTCDay()) / 7) + 1; };
+  F.WEEKNUM = (a, c, H) => { const d = serialToDate(H.toNum(s(a, c, H, 0))); const start = Date.UTC(d.getUTCFullYear(), 0, 1); return Math.floor(((d.getTime() - start) / 86400000 + new Date(start).getUTCDay()) / 7) + 1; };
   F.DAYS = (a, c, H) => H.toNum(s(a, c, H, 0)) - H.toNum(s(a, c, H, 1));
   F.EDATE = (a, c, H) => { const d = serialToDate(H.toNum(s(a, c, H, 0))); const mo = H.toNum(s(a, c, H, 1)); return dateToSerial(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + mo, d.getUTCDate()))); };
   F.EOMONTH = (a, c, H) => { const d = serialToDate(H.toNum(s(a, c, H, 0))); const mo = H.toNum(s(a, c, H, 1)); return dateToSerial(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + mo + 1, 0))); };
-  F.DATEDIF = (a, c, H) => { const s1 = serialToDate(H.toNum(s(a, c, H, 0))); const s2 = serialToDate(H.toNum(s(a, c, H, 1))); const unit = H.toStr(H.scalar(a[2], c)).toUpperCase(); const days = (s2 - s1) / 86400000; if (unit === "D") return Math.round(days); if (unit === "M") return (s2.getUTCFullYear() - s1.getUTCFullYear()) * 12 + (s2.getUTCMonth() - s1.getUTCMonth()); if (unit === "Y") return s2.getUTCFullYear() - s1.getUTCFullYear(); return ERR.NUM(); };
+  F.DATEDIF = (a, c, H) => { const s1 = serialToDate(H.toNum(s(a, c, H, 0))); const s2 = serialToDate(H.toNum(s(a, c, H, 1))); const unit = H.toStr(H.scalar(a[2], c)).toUpperCase(); const days = (s2.getTime() - s1.getTime()) / 86400000; if (unit === "D") return Math.round(days); if (unit === "M") return (s2.getUTCFullYear() - s1.getUTCFullYear()) * 12 + (s2.getUTCMonth() - s1.getUTCMonth()); if (unit === "Y") return s2.getUTCFullYear() - s1.getUTCFullYear(); return ERR.NUM(); };
 
   // ---- Information ----
   F.ISBLANK = (a, c, H) => { const v = H.scalar(a[0], c); return v == null || v === ""; };
@@ -1068,7 +1188,7 @@ const FUNCTIONS = (() => {
   F.ISODD = (a, c, H) => Math.abs(Math.trunc(H.toNum(H.scalar(a[0], c))) % 2) === 1;
   F.N = (a, c, H) => { const v = H.scalar(a[0], c); if (typeof v === "number") return v; if (typeof v === "boolean") return v ? 1 : 0; return 0; };
   F.NA = () => ERR.NA();
-  F.ERRORTYPE = (a, c, H) => { const v = H.scalar(a[0], c); if (!isErr(v)) return ERR.NA(); const map = { "#NULL!": 1, "#DIV/0!": 2, "#VALUE!": 3, "#REF!": 4, "#NAME?": 5, "#NUM!": 6, "#N/A": 7 }; return map[v.value] || ERR.NA(); };
+  F.ERRORTYPE = (a, c, H) => { const v = H.scalar(a[0], c); if (!isErr(v)) return ERR.NA(); const map: Record<string, number> = { "#NULL!": 1, "#DIV/0!": 2, "#VALUE!": 3, "#REF!": 4, "#NAME?": 5, "#NUM!": 6, "#N/A": 7 }; return map[v.value] || ERR.NA(); };
 
   return F;
 })();
@@ -1084,36 +1204,37 @@ const DEFAULT_ROW_H = 24;
 const HEAD_W = 44;
 const MAX_PRINT_CELLS = 100000;
 
-const model = {
+const model: Model = {
   revision: 0,
   title: "Untitled spreadsheet",
   sheetOrder: [],
   sheets: {},           // id -> { id, name, rows, cols, colWidths, rowHeights, frozenRows, frozenCols }
   cells: {},            // id -> { REF -> { value, fmt, version } }
 };
-let activeSheetId = null;
+// `null` until the first snapshot names a sheet; everything that reads it runs after that.
+let activeSheetId: string = null!;
 let engine = makeEngine(model);
 function rebuildEngine() { engine = makeEngine(model); }
 
 // Selection: anchor + focus (row/col). The visible rectangle is selRange().
-let anchor = { r: 0, c: 0 };
-function selRange() {
+let anchor: RC = { r: 0, c: 0 };
+function selRange(): Range {
   return { r1: Math.min(anchor.r, focus.r), c1: Math.min(anchor.c, focus.c), r2: Math.max(anchor.r, focus.r), c2: Math.max(anchor.c, focus.c) };
 }
-let focus = { r: 0, c: 0 };
+let focus: RC = { r: 0, c: 0 };
 
 // Everyone else here, and where they are; the events come from the server.
-const roster = new PresenceRoster(clientId);
+const roster = new PresenceRoster<SelectionCursor>(clientId);
 
 // ===========================================================================
 // Sheet accessors
 // ===========================================================================
-function curSheet() { return model.sheets[activeSheetId]; }
-function curCells() { return model.cells[activeSheetId] || (model.cells[activeSheetId] = {}); }
-function getCell(ref) { return curCells()[ref] || null; }
-function cellRaw(ref) { const c = getCell(ref); return c ? c.value : ""; }
-function colWidth(c) { return curSheet().colWidths[c] || DEFAULT_COL_W; }
-function rowHeight(r) { return curSheet().rowHeights[r] || DEFAULT_ROW_H; }
+function curSheet(): SheetMeta { return model.sheets[activeSheetId]; }
+function curCells(): CellMap { return model.cells[activeSheetId] || (model.cells[activeSheetId] = {}); }
+function getCell(ref: string): Cell | null { return curCells()[ref] || null; }
+function cellRaw(ref: string): string { const c = getCell(ref); return c ? c.value : ""; }
+function colWidth(c: number): number { return curSheet().colWidths[c] || DEFAULT_COL_W; }
+function rowHeight(r: number): number { return curSheet().rowHeights[r] || DEFAULT_ROW_H; }
 
 // ===========================================================================
 // Build chrome: topbar, toolbar, formula bar, grid container, tabs
@@ -1127,7 +1248,7 @@ const topbar = el("div", { class: "topbar" }, [
 ]);
 
 // Number format dropdown
-const NUMBER_FORMATS = [
+const NUMBER_FORMATS: SelectOption[] = [
   { value: "auto", label: "Automatic", ex: "" },
   { value: "text", label: "Plain text", ex: "" },
   { sep: true },
@@ -1164,8 +1285,8 @@ const strikeBtn = iconBtn(ICONS.strike, "Strikethrough", () => toggleFmt("s"));
 
 // A colour or an alignment is one formatting key over the selection; left align is
 // the absence of the key.
-function setColorOnSelection(key, color) { setFmtOnSelection((f) => { f[key] = color; }); }
-function setAlignOnSelection(align) {
+function setColorOnSelection(key: "c" | "bg", color: string): void { setFmtOnSelection((f) => { f[key] = color; }); }
+function setAlignOnSelection(align: "l" | "c" | "r"): void {
   setFmtOnSelection((f) => { if (align === "l") delete f.a; else f.a = align; });
 }
 const textColorBtn = colorBtn(ICONS.textcolor, "Text color", "#1d1d20", (color) => setColorOnSelection("c", color));
@@ -1225,16 +1346,24 @@ document.body.appendChild(printWorkbook);
 // Save / operations queue — the library's scheduler over this gadget's payload
 // ===========================================================================
 let applyingRemote = false;
+// A queued cell edit; `baseVersion` is set only when the undo/redo path pins one.
+interface PendingCellOp {
+  sheetId: string;
+  ref: string;
+  value: string | null;
+  fmt: CellFmt | null;
+  baseVersion?: number;
+}
 // Pending local ops keyed to flush together.
-const pendingCellOps = new Map(); // "sheetId!REF" -> { sheetId, ref, value, fmt }
-let pendingStructure = null;      // latest structure snapshot to send
-const pendingReplacements = new Map(); // sheetId -> cells (full)
+const pendingCellOps = new Map<string, PendingCellOp>(); // "sheetId!REF" -> { sheetId, ref, value, fmt }
+let pendingStructure: StructureUpdate | null = null;      // latest structure snapshot to send
+const pendingReplacements = new Map<string, CellMap>(); // sheetId -> cells (full)
 
-function queueCellOp(sheetId, ref, value, fmt) {
+function queueCellOp(sheetId: string, ref: string, value: string | null, fmt: CellFmt | null): void {
   pendingCellOps.set(sheetId + "!" + ref, { sheetId, ref, value, fmt });
   scheduleSave();
 }
-function queueStructure() {
+function queueStructure(): void {
   pendingStructure = {
     title: model.title,
     sheetOrder: model.sheetOrder.slice(),
@@ -1242,7 +1371,7 @@ function queueStructure() {
   };
   scheduleSave();
 }
-function queueReplacement(sheetId) {
+function queueReplacement(sheetId: string): void {
   pendingReplacements.set(sheetId, JSON.parse(JSON.stringify(model.cells[sheetId] || {})));
   scheduleSave();
 }
@@ -1255,20 +1384,20 @@ const saver = new SaveScheduler({
   onStatus: (kind, message) => saveStatus.set(kind, message),
 });
 
-function scheduleSave() {
+function scheduleSave(): void {
   if (applyingRemote) return;
   saver.schedule();
 }
 
 // Sends everything queued as one operation and adopts what the server acknowledged.
-async function sendPendingOperation() {
+async function sendPendingOperation(): Promise<SaveOutcome> {
   const sentCellOps = [...pendingCellOps];
   const sentStructure = pendingStructure;
   const sentReplacements = [...pendingReplacements];
   if (!sentCellOps.length && !sentStructure && !sentReplacements.length) return "saved";
 
-  const cellOps = sentCellOps.map(([, op]) => {
-    const cur = (model.cells[op.sheetId] || {})[op.ref];
+  const cellOps: CellOp[] = sentCellOps.map(([, op]) => {
+    const cur: Cell | undefined = (model.cells[op.sheetId] || {})[op.ref];
     return { sheetId: op.sheetId, ref: op.ref, value: op.value, fmt: op.fmt, baseVersion: op.baseVersion || (cur ? cur.version : 0) };
   });
   const sheetReplacements = sentReplacements.map(([sheetId, cells]) => ({ sheetId, cells }));
@@ -1305,20 +1434,31 @@ async function sendPendingOperation() {
 // ===========================================================================
 // Undo / redo (local history of inverse cell/structure snapshots)
 // ===========================================================================
-const undoStack = [];
-const redoStack = [];
-let historyBatch = null;
+// One cell as it was before a batch touched it (`null` when it did not exist).
+interface HistoryRecord {
+  sheetId: string;
+  ref: string;
+  prev: Cell | null;
+}
+// One undoable step: every cell it changed, by "sheetId!REF".
+interface HistoryBatch {
+  cells: Map<string, HistoryRecord>;
+  sheetId: string;
+}
+const undoStack: HistoryBatch[] = [];
+const redoStack: HistoryBatch[] = [];
+let historyBatch: HistoryBatch | null = null;
 
-function beginBatch() { historyBatch = { cells: new Map(), sheetId: activeSheetId }; }
-function recordCell(sheetId, ref) {
+function beginBatch(): void { historyBatch = { cells: new Map(), sheetId: activeSheetId }; }
+function recordCell(sheetId: string, ref: string): void {
   if (!historyBatch) beginBatch();
   const key = sheetId + "!" + ref;
-  if (!historyBatch.cells.has(key)) {
-    const cur = (model.cells[sheetId] || {})[ref];
-    historyBatch.cells.set(key, { sheetId, ref, prev: cur ? { ...cur } : null });
+  if (!historyBatch!.cells.has(key)) {
+    const cur: Cell | undefined = (model.cells[sheetId] || {})[ref];
+    historyBatch!.cells.set(key, { sheetId, ref, prev: cur ? { ...cur } : null });
   }
 }
-function commitBatch() {
+function commitBatch(): void {
   if (!historyBatch || !historyBatch.cells.size) { historyBatch = null; return; }
   undoStack.push(historyBatch);
   if (undoStack.length > 200) undoStack.shift();
@@ -1326,8 +1466,8 @@ function commitBatch() {
   historyBatch = null;
   updateUndoButtons();
 }
-function applyHistory(entry, into) {
-  const inverse = { cells: new Map(), sheetId: entry.sheetId };
+function applyHistory(entry: HistoryBatch, into: HistoryBatch[]): void {
+  const inverse: HistoryBatch = { cells: new Map(), sheetId: entry.sheetId };
   for (const [key, rec] of entry.cells) {
     const cells = model.cells[rec.sheetId] || (model.cells[rec.sheetId] = {});
     const now = cells[rec.ref] ? { ...cells[rec.ref] } : null;
@@ -1344,14 +1484,14 @@ function applyHistory(entry, into) {
   renderGrid();
   updateUndoButtons();
 }
-function undo() { if (!undoStack.length) return; applyHistory(undoStack.pop(), redoStack); }
-function redo() { if (!redoStack.length) return; applyHistory(redoStack.pop(), undoStack); }
-function updateUndoButtons() { undoBtn.disabled = !undoStack.length; redoBtn.disabled = !redoStack.length; }
+function undo(): void { if (!undoStack.length) return; applyHistory(undoStack.pop()!, redoStack); }
+function redo(): void { if (!redoStack.length) return; applyHistory(redoStack.pop()!, undoStack); }
+function updateUndoButtons(): void { undoBtn.disabled = !undoStack.length; redoBtn.disabled = !redoStack.length; }
 
 // ===========================================================================
 // Cell mutation primitives
 // ===========================================================================
-function setCellValue(ref, value, { batch = true } = {}) {
+function setCellValue(ref: string, value: string | null, { batch = true }: { batch?: boolean } = {}): void {
   const sheetId = activeSheetId;
   if (batch) recordCell(sheetId, ref);
   const cells = curCells();
@@ -1364,12 +1504,12 @@ function setCellValue(ref, value, { batch = true } = {}) {
   cells[ref] = { value: value == null ? "" : String(value), fmt: fmt || null, version: cur ? cur.version : 0 };
   queueCellOp(sheetId, ref, cells[ref].value, cells[ref].fmt);
 }
-function setCellFmt(ref, mutator) {
+function setCellFmt(ref: string, mutator: (f: CellFmt) => void): void {
   const sheetId = activeSheetId;
   recordCell(sheetId, ref);
   const cells = curCells();
   const cur = cells[ref];
-  const fmt = cur && cur.fmt ? { ...cur.fmt } : {};
+  const fmt: CellFmt = cur && cur.fmt ? { ...cur.fmt } : {};
   mutator(fmt);
   const clean = Object.keys(fmt).length ? fmt : null;
   const value = cur ? cur.value : "";
@@ -1381,7 +1521,7 @@ function setCellFmt(ref, mutator) {
 // ===========================================================================
 // Formatting actions over the selection
 // ===========================================================================
-function forEachSelected(fn) {
+function forEachSelected(fn: (ref: string, row: number, col: number) => void): void {
   const r = selRange();
   beginBatch();
   for (let row = r.r1; row <= r.r2; row++) for (let col = r.c1; col <= r.c2; col++) fn(rcToRef(row, col), row, col);
@@ -1389,7 +1529,9 @@ function forEachSelected(fn) {
   rebuildEngine();
   renderGrid();
 }
-function selectionFmtAllHave(key) {
+// The formatting keys that are on/off flags.
+type FlagFmtKey = "b" | "i" | "u" | "s" | "wrap";
+function selectionFmtAllHave(key: FlagFmtKey): boolean {
   const r = selRange();
   for (let row = r.r1; row <= r.r2; row++) for (let col = r.c1; col <= r.c2; col++) {
     const c = getCell(rcToRef(row, col));
@@ -1397,16 +1539,16 @@ function selectionFmtAllHave(key) {
   }
   return true;
 }
-function toggleFmt(key) {
+function toggleFmt(key: FlagFmtKey): void {
   const on = !selectionFmtAllHave(key);
   forEachSelected((ref) => setCellFmt(ref, (f) => { if (on) f[key] = true; else delete f[key]; }));
   refreshToolbarState();
 }
-function setFmtOnSelection(mutator) {
+function setFmtOnSelection(mutator: (f: CellFmt) => void): void {
   forEachSelected((ref) => setCellFmt(ref, mutator));
   refreshToolbarState();
 }
-function changeDecimals(delta) {
+function changeDecimals(delta: number): void {
   forEachSelected((ref) => setCellFmt(ref, (f) => {
     let d = f.d != null ? f.d : (f.nf === "currency" || f.nf === "percent" || f.nf === "number" ? 2 : defaultDecimalsFor(ref));
     d = Math.max(0, Math.min(10, d + delta));
@@ -1414,20 +1556,20 @@ function changeDecimals(delta) {
     if (!f.nf) f.nf = "number";
   }));
 }
-function defaultDecimalsFor(ref) {
+function defaultDecimalsFor(ref: string): number {
   const v = engine.computeRef(activeSheetId, ref);
   if (typeof v === "number" && !Number.isInteger(v)) return 2;
   return 0;
 }
-function clearFormatting() {
-  forEachSelected((ref) => setCellFmt(ref, (f) => { for (const k of Object.keys(f)) delete f[k]; }));
+function clearFormatting(): void {
+  forEachSelected((ref) => setCellFmt(ref, (f) => { for (const k of Object.keys(f) as (keyof CellFmt)[]) delete f[k]; }));
   refreshToolbarState();
 }
 
-function autoSum() {
+function autoSum(): void {
   const r = selRange();
   // If single cell, sum the contiguous numbers above (or to the left).
-  let target, rangeStr;
+  let target: string | undefined, rangeStr: string | undefined;
   if (r.r1 === r.r2 && r.c1 === r.c2) {
     const col = r.c1; let top = r.r1 - 1;
     while (top >= 0 && isNumericCell(rcToRef(top, col))) top--;
@@ -1453,25 +1595,29 @@ function autoSum() {
     moveActive(r.r1, r.c1); startEdit(target, false);
   }
 }
-function isNumericCell(ref) { const v = engine.computeRef(activeSheetId, ref); return typeof v === "number"; }
+function isNumericCell(ref: string): boolean { const v = engine.computeRef(activeSheetId, ref); return typeof v === "number"; }
 
 // ===========================================================================
 // Insert / delete rows & columns (adjusts formula references)
 // ===========================================================================
-function shiftRefsInFormula(formula, fn) {
+function shiftRefsInFormula(formula: string, fn: (ref: string) => string | null): string {
   try {
     const ast = parseFormula(formula.slice(1));
     walkRefs(ast, fn);
     return "=" + serializeAst(ast);
   } catch (e) { return formula; }
 }
-function walkRefs(node, fn) {
+function walkRefs(node: Ast | undefined, fn: (ref: string) => string | null): void {
   if (!node || typeof node !== "object") return;
   if (node.k === "ref") { const nr = fn(node.ref); if (nr != null) node.ref = nr; }
   else if (node.k === "range") { const a = fn(node.a); const b = fn(node.b); if (a != null) node.a = a; if (b != null) node.b = b; }
-  else { for (const key of ["a", "b"]) if (node[key]) walkRefs(node[key], fn); if (node.args) node.args.forEach((n) => walkRefs(n, fn)); }
+  else {
+    // Every other kind holds its operands under `a`/`b` and its arguments under `args`.
+    const branches: { k: string; a?: Ast; b?: Ast; args?: Ast[] } = node;
+    for (const key of ["a", "b"] as const) if (branches[key]) walkRefs(branches[key], fn); if (branches.args) branches.args.forEach((n) => walkRefs(n, fn));
+  }
 }
-function adjustRef(ref, rowAt, rowDelta, colAt, colDelta) {
+function adjustRef(ref: string, rowAt: number, rowDelta: number, colAt: number, colDelta: number): string | null {
   const bang = ref.indexOf("!");
   const sheetPrefix = bang >= 0 ? ref.slice(0, bang + 1) : "";
   const body = bang >= 0 ? ref.slice(bang + 1) : ref;
@@ -1485,7 +1631,7 @@ function adjustRef(ref, rowAt, rowDelta, colAt, colDelta) {
   return sheetPrefix + rcToRef(r, c);
 }
 
-function rewriteAllFormulas(rowAt, rowDelta, colAt, colDelta) {
+function rewriteAllFormulas(rowAt: number, rowDelta: number, colAt: number, colDelta: number): void {
   const cells = curCells();
   for (const [ref, cell] of Object.entries(cells)) {
     if (cell.value && cell.value[0] === "=") {
@@ -1495,10 +1641,10 @@ function rewriteAllFormulas(rowAt, rowDelta, colAt, colDelta) {
   }
 }
 
-function rebuildSheetCells(mapFn) {
+function rebuildSheetCells(mapFn: (r: number, c: number) => RC | null): void {
   // mapFn(r,c) -> {r,c}|null ; moves cells to new positions.
   const old = curCells();
-  const next = {};
+  const next: CellMap = {};
   for (const [ref, cell] of Object.entries(old)) {
     const rc = parseRef(ref); if (!rc) continue;
     const nn = mapFn(rc.r, rc.c);
@@ -1508,7 +1654,7 @@ function rebuildSheetCells(mapFn) {
   model.cells[activeSheetId] = next;
 }
 
-function insertRows(at, count) {
+function insertRows(at: number, count: number): void {
   const sh = curSheet();
   rewriteAllFormulas(at, count, 0, 0);
   rebuildSheetCells((r, c) => ({ r: r >= at ? r + count : r, c }));
@@ -1517,7 +1663,7 @@ function insertRows(at, count) {
   commitStructuralChange();
   moveActive(at, selRange().c1);
 }
-function insertCols(at, count) {
+function insertCols(at: number, count: number): void {
   const sh = curSheet();
   rewriteAllFormulas(0, 0, at, count);
   rebuildSheetCells((r, c) => ({ r, c: c >= at ? c + count : c }));
@@ -1526,7 +1672,7 @@ function insertCols(at, count) {
   commitStructuralChange();
   moveActive(selRange().r1, at);
 }
-function deleteRows() {
+function deleteRows(): void {
   const r = selRange();
   const at = r.r1, count = r.r2 - r.r1 + 1;
   const sh = curSheet();
@@ -1538,7 +1684,7 @@ function deleteRows() {
   commitStructuralChange();
   moveActive(Math.min(at, sh.rows - 1), r.c1);
 }
-function deleteCols() {
+function deleteCols(): void {
   const r = selRange();
   const at = r.c1, count = r.c2 - r.c1 + 1;
   const sh = curSheet();
@@ -1550,17 +1696,17 @@ function deleteCols() {
   commitStructuralChange();
   moveActive(r.r1, Math.min(at, sh.cols - 1));
 }
-function shiftDims(dims, at, count) {
+function shiftDims(dims: Dims, at: number, count: number): void {
   const entries = Object.entries(dims).map(([k, v]) => [Number(k), v]);
   for (const k of Object.keys(dims)) delete dims[k];
   for (const [k, v] of entries) dims[k >= at ? k + count : k] = v;
 }
-function removeDims(dims, at, count) {
+function removeDims(dims: Dims, at: number, count: number): void {
   const entries = Object.entries(dims).map(([k, v]) => [Number(k), v]);
   for (const k of Object.keys(dims)) delete dims[k];
   for (const [k, v] of entries) { if (k >= at && k < at + count) continue; dims[k > at ? k - count : k] = v; }
 }
-function commitStructuralChange() {
+function commitStructuralChange(): void {
   // Structural row/col changes move many cells: resend whole sheet + structure.
   queueStructure();
   queueReplacement(activeSheetId);
@@ -1572,13 +1718,13 @@ function commitStructuralChange() {
 // ===========================================================================
 // Sort
 // ===========================================================================
-function sortSelection(asc) {
+function sortSelection(asc: boolean): void {
   const r = selRange();
   if (r.r1 === r.r2) return;
   const cells = curCells();
-  const rows = [];
+  const rows: { rowCells: Record<number, Cell>; keyVal: Value }[] = [];
   for (let row = r.r1; row <= r.r2; row++) {
-    const rowCells = {};
+    const rowCells: Record<number, Cell> = {};
     for (let col = r.c1; col <= r.c2; col++) { const c = cells[rcToRef(row, col)]; if (c) rowCells[col] = { ...c }; }
     const keyVal = engine.computeRef(activeSheetId, rcToRef(row, r.c1));
     rows.push({ rowCells, keyVal });
@@ -1586,7 +1732,7 @@ function sortSelection(asc) {
   rows.sort((x, y) => {
     let a = x.keyVal, b = y.keyVal;
     a = a == null ? "" : a; b = b == null ? "" : b;
-    let cmp;
+    let cmp: number;
     if (typeof a === "number" && typeof b === "number") cmp = a - b;
     else cmp = String(a).toLowerCase() < String(b).toLowerCase() ? -1 : String(a).toLowerCase() > String(b).toLowerCase() ? 1 : 0;
     return asc ? cmp : -cmp;
@@ -1611,13 +1757,13 @@ function sortSelection(asc) {
 // Grid rendering
 // ===========================================================================
 let renderScheduled = false;
-function renderGrid() {
+function renderGrid(): void {
   if (renderScheduled) return;
   renderScheduled = true;
   requestAnimationFrame(() => { renderScheduled = false; doRenderGrid(); });
 }
 
-function doRenderGrid() {
+function doRenderGrid(): void {
   const sh = curSheet();
   if (!sh) return;
   const rng = selRange();
@@ -1672,7 +1818,7 @@ function doRenderGrid() {
   renderPresence();
 }
 
-function renderCell(ref, r, c, rng) {
+function renderCell(ref: string, r: number, c: number, rng: Range): HTMLTableCellElement {
   const cell = getCell(ref);
   const td = el("td", { class: "cell", "data-ref": ref, "data-r": r, "data-c": c });
   const fmt = cell?.fmt;
@@ -1704,7 +1850,7 @@ function renderCell(ref, r, c, rng) {
   return td;
 }
 
-function printBounds(sheetId) {
+function printBounds(sheetId: string): { rows: number; cols: number } {
   let maxRow = 0, maxCol = 0;
   for (const [ref, cell] of Object.entries(model.cells[sheetId] || {})) {
     if ((cell.value === "" || cell.value == null) && !cell.fmt) continue;
@@ -1720,7 +1866,7 @@ function printBounds(sheetId) {
   };
 }
 
-function renderPrintCell(sheetId, ref, r, c) {
+function renderPrintCell(sheetId: string, ref: string, r: number, c: number): HTMLTableCellElement {
   const cell = model.cells[sheetId]?.[ref] || null;
   const fmt = cell?.fmt;
   const computed = cell && cell.value !== "" && cell.value != null
@@ -1747,7 +1893,7 @@ function renderPrintCell(sheetId, ref, r, c) {
   return td;
 }
 
-function renderPrintSheet(sheetId) {
+function renderPrintSheet(sheetId: string): HTMLElement {
   const sheet = model.sheets[sheetId];
   const bounds = printBounds(sheetId);
   const section = el("section", { class: "print-sheet" });
@@ -1792,7 +1938,7 @@ function renderPrintSheet(sheetId) {
   return section;
 }
 
-function renderPrintWorkbook() {
+function renderPrintWorkbook(): void {
   printWorkbook.replaceChildren(...model.sheetOrder
     .filter((sheetId) => model.sheets[sheetId])
     .map(renderPrintSheet));
@@ -1804,16 +1950,16 @@ window.matchMedia("print").addEventListener("change", (event) => {
 });
 
 // Position rowheads sticky-left offset already handled by CSS `left:0`.
-function positionActiveOverlays() { /* active box handled via .active class */ }
+function positionActiveOverlays(): void { /* active box handled via .active class */ }
 
 // ===========================================================================
 // Selection & navigation
 // ===========================================================================
-function clampRC(r, c) {
+function clampRC(r: number, c: number): RC {
   const sh = curSheet();
   return { r: Math.max(0, Math.min(sh.rows - 1, r)), c: Math.max(0, Math.min(sh.cols - 1, c)) };
 }
-function moveActive(r, c, extend = false) {
+function moveActive(r: number, c: number, extend = false): void {
   const p = clampRC(r, c);
   focus = { r: p.r, c: p.c };
   if (!extend) anchor = { r: p.r, c: p.c };
@@ -1821,9 +1967,9 @@ function moveActive(r, c, extend = false) {
   scrollActiveIntoView();
   presence.schedule();
 }
-function setSelection(a, f) { anchor = { ...a }; focus = { ...f }; updateSelectionUI(); presence.schedule(); }
+function setSelection(a: RC, f: RC): void { anchor = { ...a }; focus = { ...f }; updateSelectionUI(); presence.schedule(); }
 
-function updateSelectionUI() {
+function updateSelectionUI(): void {
   const rng = selRange();
   // Update cell classes without full re-render for speed.
   const prevSel = gridTable.querySelectorAll("td.cell.sel, td.cell.active");
@@ -1838,12 +1984,12 @@ function updateSelectionUI() {
     else td.classList.add("sel");
   }
   // headers
-  gridTable.querySelectorAll("th.colhead").forEach((th) => {
-    const c = +th.dataset.col;
+  gridTable.querySelectorAll<HTMLTableCellElement>("th.colhead").forEach((th) => {
+    const c = +th.dataset.col!;
     if (c >= rng.c1 && c <= rng.c2) th.classList.add(rng.r1 === 0 && rng.r2 === sh.rows - 1 ? "full" : "hl");
   });
-  gridTable.querySelectorAll("th.rowhead").forEach((th) => {
-    const r = +th.dataset.row;
+  gridTable.querySelectorAll<HTMLTableCellElement>("th.rowhead").forEach((th) => {
+    const r = +th.dataset.row!;
     if (r >= rng.r1 && r <= rng.r2) th.classList.add(rng.c1 === 0 && rng.c2 === sh.cols - 1 ? "full" : "hl");
   });
   // name box + formula bar
@@ -1853,9 +1999,9 @@ function updateSelectionUI() {
   formulaInput.value = active ? active.value : "";
   refreshToolbarState();
 }
-function cellEl(r, c) { return gridTable.querySelector(`td.cell[data-r="${r}"][data-c="${c}"]`); }
+function cellEl(r: number, c: number): HTMLTableCellElement | null { return gridTable.querySelector<HTMLTableCellElement>(`td.cell[data-r="${r}"][data-c="${c}"]`); }
 
-function scrollActiveIntoView() {
+function scrollActiveIntoView(): void {
   const td = cellEl(focus.r, focus.c);
   if (!td) return;
   const sr = gridScroll.getBoundingClientRect();
@@ -1870,9 +2016,9 @@ function scrollActiveIntoView() {
 // ===========================================================================
 // Toolbar live state
 // ===========================================================================
-function refreshToolbarState() {
+function refreshToolbarState(): void {
   const active = getCell(rcToRef(focus.r, focus.c));
-  const f = active?.fmt || {};
+  const f: CellFmt = active?.fmt || {};
   boldBtn.classList.toggle("active", !!f.b);
   italicBtn.classList.toggle("active", !!f.i);
   underlineBtn.classList.toggle("active", !!f.u);
@@ -1887,9 +2033,9 @@ function refreshToolbarState() {
 // ===========================================================================
 // Cell editing
 // ===========================================================================
-let editing = null; // { ref, r, c, initial }
-function startEdit(ref, replace = false, seed = null) {
-  const rc = parseRef(ref);
+let editing: { ref: string; r: number; c: number } | null = null; // { ref, r, c, initial }
+function startEdit(ref: string, replace = false, seed: string | null = null): void {
+  const rc = parseRef(ref)!;
   const td = cellEl(rc.r, rc.c);
   if (!td) return;
   editing = { ref, r: rc.r, c: rc.c };
@@ -1905,7 +2051,7 @@ function startEdit(ref, replace = false, seed = null) {
   cellEditor.value = text;
   cellEditor.style.display = "block";
   // font matches
-  const f = cell?.fmt || {};
+  const f: CellFmt = cell?.fmt || {};
   cellEditor.style.fontWeight = f.b ? "700" : "400";
   cellEditor.style.fontStyle = f.i ? "italic" : "normal";
   cellEditor.style.textAlign = f.a === "c" ? "center" : f.a === "r" ? "right" : "left";
@@ -1915,13 +2061,14 @@ function startEdit(ref, replace = false, seed = null) {
   syncEditorSize();
   formulaInput.value = text;
 }
-function syncEditorSize() {
+function syncEditorSize(): void {
   cellEditor.style.height = "auto";
   cellEditor.style.height = Math.max(cellEditor.scrollHeight, DEFAULT_ROW_H) + "px";
-  const w = Math.max(cellEditor.scrollWidth + 8, cellEl(editing.r, editing.c)?.offsetWidth || 60);
+  // The editor is only shown, and so only sized, while a cell is being edited.
+  const w = Math.max(cellEditor.scrollWidth + 8, cellEl(editing!.r, editing!.c)?.offsetWidth || 60);
   cellEditor.style.width = w + "px";
 }
-function commitEdit(advance = "down") {
+function commitEdit(advance: "down" | "up" | "right" | "left" | "none" = "down"): void {
   if (!editing) return;
   const { ref, r, c } = editing;
   const value = cellEditor.value;
@@ -1939,7 +2086,7 @@ function commitEdit(advance = "down") {
   else moveActive(r, c);
   gridScroll.focus();
 }
-function cancelEdit() {
+function cancelEdit(): void {
   if (!editing) return;
   const { r, c } = editing;
   editing = null;
@@ -1959,35 +2106,36 @@ cellEditor.addEventListener("keydown", (e) => {
 // ===========================================================================
 // Mouse interaction on grid
 // ===========================================================================
-let mouseSelecting = false;
+let mouseSelecting: false | "col" | "row" | "cell" = false;
 let resizeState = null;
 
 gridTable.addEventListener("mousedown", (e) => {
+  if (!(e.target instanceof Element)) return;
   // Column/row resize handles
-  const colResize = e.target.closest(".col-resize");
-  if (colResize) { startColResize(+colResize.dataset.col, e); e.preventDefault(); return; }
-  const rowResize = e.target.closest(".row-resize");
-  if (rowResize) { startRowResize(+rowResize.dataset.row, e); e.preventDefault(); return; }
+  const colResize = e.target.closest<HTMLElement>(".col-resize");
+  if (colResize) { startColResize(+colResize.dataset.col!, e); e.preventDefault(); return; }
+  const rowResize = e.target.closest<HTMLElement>(".row-resize");
+  if (rowResize) { startRowResize(+rowResize.dataset.row!, e); e.preventDefault(); return; }
 
-  const colhead = e.target.closest("th.colhead");
+  const colhead = e.target.closest<HTMLTableCellElement>("th.colhead");
   if (colhead) {
-    const c = +colhead.dataset.col; const sh = curSheet();
+    const c = +colhead.dataset.col!; const sh = curSheet();
     if (editing) commitEdit("none");
     setSelection({ r: 0, c }, { r: sh.rows - 1, c });
     focus = { r: 0, c }; updateSelectionUI();
     mouseSelecting = "col"; e.preventDefault(); return;
   }
-  const rowhead = e.target.closest("th.rowhead");
+  const rowhead = e.target.closest<HTMLTableCellElement>("th.rowhead");
   if (rowhead) {
-    const r = +rowhead.dataset.row; const sh = curSheet();
+    const r = +rowhead.dataset.row!; const sh = curSheet();
     if (editing) commitEdit("none");
     setSelection({ r, c: 0 }, { r, c: sh.cols - 1 });
     focus = { r, c: 0 }; updateSelectionUI();
     mouseSelecting = "row"; e.preventDefault(); return;
   }
-  const td = e.target.closest("td.cell");
+  const td = e.target.closest<HTMLTableCellElement>("td.cell");
   if (td) {
-    const r = +td.dataset.r, c = +td.dataset.c;
+    const r = +td.dataset.r!, c = +td.dataset.c!;
     if (editing) commitEdit("none");
     if (e.shiftKey) { focus = { r, c }; updateSelectionUI(); presence.schedule(); }
     else moveActive(r, c);
@@ -1998,9 +2146,10 @@ gridTable.addEventListener("mousedown", (e) => {
 });
 gridTable.addEventListener("mousemove", (e) => {
   if (!mouseSelecting) return;
-  const td = e.target.closest("td.cell") || e.target.closest("th");
-  let r, c;
-  if (td && td.classList.contains("cell")) { r = +td.dataset.r; c = +td.dataset.c; }
+  if (!(e.target instanceof Element)) return;
+  const td = e.target.closest<HTMLTableCellElement>("td.cell") || e.target.closest("th");
+  let r: number, c: number;
+  if (td && td.classList.contains("cell")) { r = +td.dataset.r!; c = +td.dataset.c!; }
   else return;
   const sh = curSheet();
   if (mouseSelecting === "col") { focus = { r: sh.rows - 1, c }; anchor = { r: 0, c: anchor.c }; }
@@ -2011,19 +2160,20 @@ gridTable.addEventListener("mousemove", (e) => {
 window.addEventListener("mouseup", () => { if (mouseSelecting) { mouseSelecting = false; presence.schedule(); } });
 
 gridTable.addEventListener("dblclick", (e) => {
-  const td = e.target.closest("td.cell");
-  if (td) startEdit(td.dataset.ref, false);
+  if (!(e.target instanceof Element)) return;
+  const td = e.target.closest<HTMLTableCellElement>("td.cell");
+  if (td) startEdit(td.dataset.ref!, false);
 });
 
 // Column/row auto double-click resize handled minimally.
-function startColResize(col, e) {
+function startColResize(col: number, e: MouseEvent): void {
   const startX = e.clientX; const startW = colWidth(col);
-  const move = (ev) => { const w = Math.max(30, startW + ev.clientX - startX); curSheet().colWidths[col] = Math.round(w); applyColWidth(col); };
+  const move = (ev: MouseEvent) => { const w = Math.max(30, startW + ev.clientX - startX); curSheet().colWidths[col] = Math.round(w); applyColWidth(col); };
   const up = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); queueStructure(); };
   window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
 }
-function applyColWidth(col) {
-  const cols = gridTable.querySelectorAll("colgroup col");
+function applyColWidth(col: number): void {
+  const cols = gridTable.querySelectorAll<HTMLTableColElement>("colgroup col");
   if (cols[col + 1]) cols[col + 1].style.width = colWidth(col) + "px";
   // Keep the pinned table width in sync so resizing doesn't reintroduce squeezing.
   const sh = curSheet();
@@ -2031,14 +2181,14 @@ function applyColWidth(col) {
   for (let c = 0; c < sh.cols; c++) totalWidth += colWidth(c);
   gridTable.style.width = totalWidth + "px";
 }
-function startRowResize(row, e) {
+function startRowResize(row: number, e: MouseEvent): void {
   const startY = e.clientY; const startH = rowHeight(row);
-  const move = (ev) => { const h = Math.max(18, startH + ev.clientY - startY); curSheet().rowHeights[row] = Math.round(h); applyRowHeight(row); };
+  const move = (ev: MouseEvent) => { const h = Math.max(18, startH + ev.clientY - startY); curSheet().rowHeights[row] = Math.round(h); applyRowHeight(row); };
   const up = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); queueStructure(); };
   window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
 }
-function applyRowHeight(row) {
-  const tr = gridTable.querySelectorAll("tbody tr")[row];
+function applyRowHeight(row: number): void {
+  const tr = gridTable.querySelectorAll<HTMLTableRowElement>("tbody tr")[row];
   if (tr) tr.style.height = rowHeight(row) + "px";
 }
 
@@ -2057,7 +2207,8 @@ gridScroll.addEventListener("keydown", (e) => {
       case "z": e.preventDefault(); e.shiftKey ? redo() : undo(); return;
       case "y": e.preventDefault(); redo(); return;
       case "c": copySelection(); return;
-      case "x": copySelection(); e._cut = true; return;
+      // TODO(types): `_cut` is an expando nothing reads; kept as it was, typed as such.
+      case "x": copySelection(); (e as KeyboardEvent & { _cut?: boolean })._cut = true; return;
       case "v": return; // handled by paste event
       case "a": e.preventDefault(); { const sh = curSheet(); setSelection({ r: 0, c: 0 }, { r: sh.rows - 1, c: sh.cols - 1 }); focus = { r: 0, c: 0 }; updateSelectionUI(); } return;
       case "arrowdown": e.preventDefault(); moveActive(jumpEdge(focus.r, focus.c, 1, 0), focus.c, e.shiftKey); return;
@@ -2084,27 +2235,29 @@ gridScroll.addEventListener("keydown", (e) => {
       if (e.key.length === 1 && !meta && !e.altKey) { e.preventDefault(); startEdit(rcToRef(focus.r, focus.c), true, e.key); }
   }
 });
-function jumpEdge(r, c, dr) {
+// TODO(types): both callers pass a fourth argument (`0`) that was always ignored; declared so the
+// calls type-check unchanged.
+function jumpEdge(r: number, c: number, dr: number, _dc?: number): number {
   const sh = curSheet();
   let nr = r + dr;
-  const has = (rr) => { const v = cellRaw(rcToRef(rr, c)); return v !== "" && v != null; };
+  const has = (rr: number) => { const v = cellRaw(rcToRef(rr, c)); return v !== "" && v != null; };
   if (nr < 0 || nr >= sh.rows) return r;
   if (has(r) && has(nr)) { while (nr + dr >= 0 && nr + dr < sh.rows && has(nr + dr)) nr += dr; return nr; }
   while (nr >= 0 && nr < sh.rows && !has(nr)) nr += dr;
   if (nr < 0 || nr >= sh.rows) return dr > 0 ? sh.rows - 1 : 0;
   return nr;
 }
-function jumpEdgeCol(r, c, dc) {
+function jumpEdgeCol(r: number, c: number, dc: number): number {
   const sh = curSheet();
   let nc = c + dc;
-  const has = (cc) => { const v = cellRaw(rcToRef(r, cc)); return v !== "" && v != null; };
+  const has = (cc: number) => { const v = cellRaw(rcToRef(r, cc)); return v !== "" && v != null; };
   if (nc < 0 || nc >= sh.cols) return c;
   if (has(c) && has(nc)) { while (nc + dc >= 0 && nc + dc < sh.cols && has(nc + dc)) nc += dc; return nc; }
   while (nc >= 0 && nc < sh.cols && !has(nc)) nc += dc;
   if (nc < 0 || nc >= sh.cols) return dc > 0 ? sh.cols - 1 : 0;
   return nc;
 }
-function moveWithinSelection(dir, mode) {
+function moveWithinSelection(dir: number, mode: "h" | "v"): void {
   const rng = selRange();
   const single = rng.r1 === rng.r2 && rng.c1 === rng.c2;
   if (single) { if (mode === "h") moveActive(focus.r, focus.c + dir); else moveActive(focus.r + dir, focus.c); return; }
@@ -2113,7 +2266,7 @@ function moveWithinSelection(dir, mode) {
   else { r += dir; if (r > rng.r2) { r = rng.r1; c++; if (c > rng.c2) c = rng.c1; } if (r < rng.r1) { r = rng.r2; c--; if (c < rng.c1) c = rng.c2; } }
   focus = { r, c }; updateSelectionUI(); scrollActiveIntoView(); presence.schedule();
 }
-function deleteSelectionContents() {
+function deleteSelectionContents(): void {
   const r = selRange();
   beginBatch();
   for (let row = r.r1; row <= r.r2; row++) for (let col = r.c1; col <= r.c2; col++) {
@@ -2126,13 +2279,13 @@ function deleteSelectionContents() {
 // ===========================================================================
 // Copy / paste (TSV via clipboard)
 // ===========================================================================
-let copyRange = null;
-function copySelection() {
+let copyRange: Range | null = null;
+function copySelection(): void {
   const r = selRange();
   copyRange = { ...r };
-  const lines = [];
+  const lines: string[] = [];
   for (let row = r.r1; row <= r.r2; row++) {
-    const cols = [];
+    const cols: string[] = [];
     for (let col = r.c1; col <= r.c2; col++) {
       const cell = getCell(rcToRef(row, col));
       let out = "";
@@ -2145,13 +2298,15 @@ function copySelection() {
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(tsv).catch(() => {});
   copyFallback = { tsv, cells: snapshotRange(r) };
 }
-let copyFallback = null;
-function snapshotRange(r) {
-  const out = [];
-  for (let row = r.r1; row <= r.r2; row++) { const line = []; for (let col = r.c1; col <= r.c2; col++) { const c = getCell(rcToRef(row, col)); line.push(c ? { value: c.value, fmt: c.fmt } : null); } out.push(line); }
+// A copied cell's content, or `null` for an empty one.
+type CopiedCell = Pick<Cell, "value" | "fmt"> | null;
+let copyFallback: { tsv: string; cells: CopiedCell[][] } | null = null;
+function snapshotRange(r: Range): CopiedCell[][] {
+  const out: CopiedCell[][] = [];
+  for (let row = r.r1; row <= r.r2; row++) { const line: CopiedCell[] = []; for (let col = r.c1; col <= r.c2; col++) { const c = getCell(rcToRef(row, col)); line.push(c ? { value: c.value, fmt: c.fmt } : null); } out.push(line); }
   return out;
 }
-function clearCopyMarquee() { copyRange = null; }
+function clearCopyMarquee(): void { copyRange = null; }
 
 gridScroll.addEventListener("paste", (e) => {
   if (editing) return;
@@ -2159,7 +2314,7 @@ gridScroll.addEventListener("paste", (e) => {
   const text = (e.clipboardData && e.clipboardData.getData("text/plain")) || "";
   pasteText(text);
 });
-function pasteText(text) {
+function pasteText(text: string): void {
   const start = selRange();
   const useSnapshot = copyFallback && copyFallback.tsv === text && copyFallback.cells;
   const rows = text.replace(/\r/g, "").split("\n");
@@ -2171,8 +2326,9 @@ function pasteText(text) {
       const rr = start.r1 + i, cc = start.c1 + j;
       if (rr >= curSheet().rows || cc >= curSheet().cols) continue;
       const ref = rcToRef(rr, cc);
-      if (useSnapshot && copyFallback.cells[i] && copyFallback.cells[i][j] !== undefined) {
-        const src = copyFallback.cells[i][j];
+      // `useSnapshot` holds only when `copyFallback` is set.
+      if (useSnapshot && copyFallback!.cells[i] && copyFallback!.cells[i][j] !== undefined) {
+        const src = copyFallback!.cells[i][j];
         recordCell(activeSheetId, ref);
         if (src) { curCells()[ref] = { value: src.value, fmt: src.fmt, version: getCell(ref)?.version || 0 }; queueCellOp(activeSheetId, ref, src.value, src.fmt); }
         else { if (getCell(ref)) { delete curCells()[ref]; queueCellOp(activeSheetId, ref, null, null); } }
@@ -2212,7 +2368,7 @@ titleInput.addEventListener("input", () => { model.title = titleInput.value.trim
 // ===========================================================================
 // Insert-function menu
 // ===========================================================================
-function openFunctionMenu(e) {
+function openFunctionMenu(e: MouseEvent): void {
   const groups = {
     "Math": ["SUM", "AVERAGE", "COUNT", "MAX", "MIN", "PRODUCT", "ROUND", "ABS", "SQRT", "MOD", "POWER"],
     "Statistical": ["MEDIAN", "STDEV", "VAR", "COUNTA", "COUNTIF", "SUMIF", "SUMIFS", "COUNTIFS", "RANK", "LARGE"],
@@ -2233,7 +2389,7 @@ function openFunctionMenu(e) {
   }
   showCtx(menu, e.clientX, e.clientY);
 }
-function insertFunction(name) {
+function insertFunction(name: string): void {
   const ref = rcToRef(focus.r, focus.c);
   startEdit(ref, true, "=" + name + "(");
 }
@@ -2241,8 +2397,8 @@ function insertFunction(name) {
 // ===========================================================================
 // Context menu (right-click on grid)
 // ===========================================================================
-let ctxEl = null;
-function showCtx(menu, x, y) {
+let ctxEl: HTMLElement | null = null;
+function showCtx(menu: HTMLElement, x: number, y: number): void {
   closeCtx();
   ctxEl = menu;
   document.body.appendChild(menu);
@@ -2250,19 +2406,20 @@ function showCtx(menu, x, y) {
   menu.style.left = Math.min(x, window.innerWidth - w - 8) + "px";
   menu.style.top = Math.min(y, window.innerHeight - h - 8) + "px";
 }
-function closeCtx() { if (ctxEl) { ctxEl.remove(); ctxEl = null; } }
-document.addEventListener("mousedown", (e) => { if (ctxEl && !ctxEl.contains(e.target)) closeCtx(); });
+function closeCtx(): void { if (ctxEl) { ctxEl.remove(); ctxEl = null; } }
+document.addEventListener("mousedown", (e) => { if (ctxEl && !ctxEl.contains(e.target instanceof Node ? e.target : null)) closeCtx(); });
 window.addEventListener("scroll", closeCtx, true);
 
 gridTable.addEventListener("contextmenu", (e) => {
-  const td = e.target.closest("td.cell");
+  if (!(e.target instanceof Element)) return;
+  const td = e.target.closest<HTMLTableCellElement>("td.cell");
   const colhead = e.target.closest("th.colhead");
   const rowhead = e.target.closest("th.rowhead");
   if (!td && !colhead && !rowhead) return;
   e.preventDefault();
-  if (td) { const r = +td.dataset.r, c = +td.dataset.c; const rng = selRange(); if (r < rng.r1 || r > rng.r2 || c < rng.c1 || c > rng.c2) moveActive(r, c); }
+  if (td) { const r = +td.dataset.r!, c = +td.dataset.c!; const rng = selRange(); if (r < rng.r1 || r > rng.r2 || c < rng.c1 || c > rng.c2) moveActive(r, c); }
   const menu = el("div", { class: "ctx" });
-  const item = (label, k, fn, danger) => { const it = el("div", { class: "ctx-item" + (danger ? " danger" : "") }, [el("span", {}, label), k ? el("span", { class: "k" }, k) : null]); it.addEventListener("click", () => { closeCtx(); fn(); }); menu.appendChild(it); };
+  const item = (label: string, k: string, fn: () => void, danger?: boolean) => { const it = el("div", { class: "ctx-item" + (danger ? " danger" : "") }, [el("span", {}, label), k ? el("span", { class: "k" }, k) : null]); it.addEventListener("click", () => { closeCtx(); fn(); }); menu.appendChild(it); };
   const sep = () => menu.appendChild(el("div", { class: "ctx-sep" }));
   item("Cut", "Ctrl+X", () => { copySelection(); deleteSelectionContents(); });
   item("Copy", "Ctrl+C", () => copySelection());
@@ -2282,7 +2439,7 @@ gridTable.addEventListener("contextmenu", (e) => {
 // ===========================================================================
 // Sheet tabs
 // ===========================================================================
-function renderTabs() {
+function renderTabs(): void {
   tabbar.replaceChildren();
   for (const id of model.sheetOrder) {
     const sh = model.sheets[id];
@@ -2296,14 +2453,14 @@ function renderTabs() {
   add.addEventListener("click", addSheet);
   tabbar.appendChild(add);
 }
-function switchSheet(id) {
+function switchSheet(id: string): void {
   if (editing) commitEdit("none");
   activeSheetId = id;
   anchor = { r: 0, c: 0 }; focus = { r: 0, c: 0 };
   renderTabs(); renderGrid(); updateSelectionUI();
   presence.schedule();
 }
-function addSheet() {
+function addSheet(): void {
   const id = "s_" + Math.random().toString(36).slice(2, 8);
   let n = model.sheetOrder.length + 1;
   while (model.sheetOrder.some((sid) => model.sheets[sid].name === "Sheet" + n)) n++;
@@ -2314,21 +2471,21 @@ function addSheet() {
   queueStructure();
   switchSheet(id);
 }
-async function renameSheet(id) {
+async function renameSheet(id: string): Promise<void> {
   const name = await promptInline("Rename sheet:", model.sheets[id].name);
   if (name == null) return;
   const clean = name.trim().slice(0, 60);
   if (clean) { model.sheets[id].name = clean; queueStructure(); renderTabs(); rebuildEngine(); renderGrid(); }
 }
-function sheetTabMenu(id, e) {
+function sheetTabMenu(id: string, e: MouseEvent): void {
   const menu = el("div", { class: "ctx" });
-  const item = (label, fn, danger) => { const it = el("div", { class: "ctx-item" + (danger ? " danger" : "") }, [el("span", {}, label)]); it.addEventListener("click", () => { closeCtx(); fn(); }); menu.appendChild(it); };
+  const item = (label: string, fn: () => void, danger?: boolean) => { const it = el("div", { class: "ctx-item" + (danger ? " danger" : "") }, [el("span", {}, label)]); it.addEventListener("click", () => { closeCtx(); fn(); }); menu.appendChild(it); };
   item("Rename", () => renameSheet(id));
   item("Duplicate", () => duplicateSheet(id));
   if (model.sheetOrder.length > 1) { menu.appendChild(el("div", { class: "ctx-sep" })); item("Delete", () => deleteSheet(id), true); }
   showCtx(menu, e.clientX, e.clientY);
 }
-function duplicateSheet(id) {
+function duplicateSheet(id: string): void {
   const src = model.sheets[id];
   const nid = "s_" + Math.random().toString(36).slice(2, 8);
   model.sheets[nid] = { ...JSON.parse(JSON.stringify(src)), id: nid, name: src.name + " copy" };
@@ -2338,7 +2495,7 @@ function duplicateSheet(id) {
   queueStructure(); queueReplacement(nid);
   switchSheet(nid);
 }
-function deleteSheet(id) {
+function deleteSheet(id: string): void {
   if (model.sheetOrder.length <= 1) return;
   const idx = model.sheetOrder.indexOf(id);
   model.sheetOrder.splice(idx, 1);
@@ -2353,25 +2510,27 @@ function deleteSheet(id) {
 // ===========================================================================
 // Reports this tab's selected range: throttled while it moves, on the library's
 // heartbeat while it does not, which is also when the roster forgets the silent.
-const presence = new PresenceReporter(
+const presence = new PresenceReporter<PresenceUpdate>(
   () => {
     const rng = selRange();
     return { ...me, sheetId: activeSheetId, r1: rng.r1, c1: rng.c1, r2: rng.r2, c2: rng.c2 };
   },
   (update) => gadget.updatePresence(update),
 );
-function renderPeers() {
+function renderPeers(): void {
   // Presence UI disabled — single-user gadget, no collaborator badges shown.
 }
-function renderPresence() {
+function renderPresence(): void {
   // Presence UI disabled — no remote selection boxes shown.
   remoteLayer.replaceChildren();
   return;
+  // Unreachable while the UI is disabled, so no narrowing applies below; the guards that follow
+  // each `!` are what would narrow it.
   for (const person of roster.entries()) {
-    const p = person.cursor;
+    const p = person.cursor!;
     if (!p || p.sheetId !== activeSheetId) continue;
     const r1 = Math.min(p.r1, p.r2), r2 = Math.max(p.r1, p.r2), c1 = Math.min(p.c1, p.c2), c2 = Math.max(p.c1, p.c2);
-    const tdA = cellEl(r1, c1), tdB = cellEl(r2, c2);
+    const tdA = cellEl(r1, c1)!, tdB = cellEl(r2, c2)!;
     if (!tdA || !tdB) continue;
     const left = tdA.offsetLeft, top = tdA.offsetTop;
     const width = tdB.offsetLeft + tdB.offsetWidth - left, height = tdB.offsetTop + tdB.offsetHeight - top;
@@ -2384,7 +2543,7 @@ function renderPresence() {
     remoteLayer.appendChild(fill); remoteLayer.appendChild(box); remoteLayer.appendChild(tag);
   }
 }
-function applyPresence(event) {
+function applyPresence(event: SheetsPresenceEvent): void {
   if (!roster.apply(event)) return;
   renderPresence(); renderPeers();
 }
@@ -2395,7 +2554,7 @@ window.addEventListener("pagehide", () => { gadget.leavePresence(clientId).catch
 // ===========================================================================
 // Remote operations
 // ===========================================================================
-function applyRemoteOperation(event) {
+function applyRemoteOperation(event: OperationEvent): void {
   if (!event || event.senderId === clientId) return;
   applyingRemote = true;
   model.revision = Math.max(model.revision, event.revision || 0);
@@ -2413,7 +2572,7 @@ function applyRemoteOperation(event) {
   saveStatus.set("synced", "Live update");
   setTimeout(() => { if (!saver.busy && !pendingCellOps.size) saveStatus.set("saved", "Saved"); }, 900);
 }
-function applyStructure(s) {
+function applyStructure(s: Structure): void {
   if (s.title != null && document.activeElement !== titleInput) { model.title = s.title; titleInput.value = s.title; }
   else if (s.title != null) model.title = s.title;
   model.sheetOrder = s.sheetOrder.slice();
@@ -2421,7 +2580,7 @@ function applyStructure(s) {
   for (const id of Object.keys(model.sheets)) if (!model.sheetOrder.includes(id)) { delete model.sheets[id]; delete model.cells[id]; }
 }
 
-function applySnapshot(doc) {
+function applySnapshot(doc: SheetsDocument): void {
   applyingRemote = true;
   model.revision = doc.revision || 0;
   model.title = doc.title || "Untitled spreadsheet";
@@ -2439,8 +2598,8 @@ function applySnapshot(doc) {
 
 // What the Durable Object calls back on; the library puts these on an RpcTarget.
 const subscriber = createSubscriber(RpcTarget, {
-  operation(event) { if (event.type === "snapshot") applySnapshot(event.document); else applyRemoteOperation(event); },
-  presence(event) { applyPresence(event); },
+  operation(event: SubscriberEvent) { if (event.type === "snapshot") applySnapshot(event.document); else applyRemoteOperation(event); },
+  presence(event: SheetsPresenceEvent) { applyPresence(event); },
 });
 
 // ===========================================================================

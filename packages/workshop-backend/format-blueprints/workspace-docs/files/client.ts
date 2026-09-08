@@ -26,13 +26,48 @@ import {
 import {
   PresenceReporter,
   PresenceRoster,
+  type SaveOutcome,
   SaveScheduler,
+  type SyncHost,
   collaboratorFor,
   createSubscriber,
 } from "gadgets:sync/client";
+import type { CustomSelect, CustomSelectOptions, PreparedImage, PromptOptions } from "gadgets:ui/client";
+import type {
+  BlockContent,
+  DocCursor,
+  DocPresenceEvent,
+  GadgetStub,
+  OperationEvent,
+  PresenceUpdate,
+  StoredBlock,
+  StoredDocument,
+  SubscriberCallbacks,
+} from "./lib/protocol.ts";
+
+// The bindings the Workshop's iframe bootstrap defines before this module runs: the RPC stub to
+// this gadget's Durable Object, and Cap'n Web's RpcTarget for the callbacks it is handed.
+declare const gadget: GadgetStub;
+declare const RpcTarget: SyncHost["RpcTarget"];
+
+// The editor hands execCommand `null` where a command takes no value and a boolean for
+// styleWithCSS; the DOM converts both to a string. The lib's signature admits only the string.
+declare global {
+  interface Document {
+    execCommand(commandId: string, showUI?: boolean, value?: string | boolean | null): boolean;
+  }
+}
+
+// Node-type guards: the `nodeType` comparisons the editor makes, as narrowings.
+function isElement(node: Node | null | undefined): node is Element {
+  return !!node && node.nodeType === 1;
+}
+function isText(node: Node | null | undefined): node is Text {
+  return !!node && node.nodeType === 3;
+}
 
 const clientId = Math.random().toString(36).slice(2);
-const isDocumentExport = ["html", "pdf"].includes(globalThis.gadgetExportFormatId);
+const isDocumentExport = ["html", "pdf"].includes((globalThis as { gadgetExportFormatId?: string }).gadgetExportFormatId ?? "");
 
 // --- Styles ----------------------------------------------------------------
 const style = document.createElement("style");
@@ -387,6 +422,7 @@ const ICONS = {
   indent: '<line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="18" x2="20" y2="18"/><line x1="13" y1="12" x2="20" y2="12"/><polyline points="6 9 9 12 6 15"/>',
   hr: '<line x1="4" y1="12" x2="20" y2="12"/>',
 };
+type IconName = keyof typeof ICONS;
 
 // --- Build UI --------------------------------------------------------------
 const editor = el("div", { class: "doc-page", contenteditable: "true", spellcheck: "true" });
@@ -403,7 +439,7 @@ const topbar = el("div", { class: "topbar" }, [
 // Toolbar. A dropdown must leave the editor's selection alone: the mousedown
 // that opens it may not move focus out of the editor, and the range the caret
 // had is what the chosen command applies to.
-function toolbarSelect(options) {
+function toolbarSelect(options: CustomSelectOptions): CustomSelect {
   const select = customSelect(options);
   select.el.addEventListener("mousedown", (e) => { e.preventDefault(); savedRange = getRange(); });
   return select;
@@ -471,16 +507,16 @@ const sizeSel = toolbarSelect({
   },
 });
 
-function applyFontSize(px) {
+function applyFontSize(px: number) {
   document.execCommand("fontSize", false, "7");
-  editor.querySelectorAll('font[size="7"]').forEach((f) => {
+  editor.querySelectorAll<HTMLFontElement>('font[size="7"]').forEach((f) => {
     f.removeAttribute("size");
     f.style.fontSize = px + "px";
   });
 }
 
 // Simple command buttons
-function cmdBtn(name, title, command, value = null) {
+function cmdBtn(name: IconName, title: string, command: string, value: string | null = null) {
   return iconBtn(ICONS[name], title, () => {
     document.execCommand(command, false, value);
     editor.focus();
@@ -496,7 +532,7 @@ const strikeBtn = cmdBtn("strike", "Strikethrough", "strikeThrough");
 
 // Color buttons (text + highlight). The picker prevents its own mousedown; the
 // selection it recolours is the one saved here.
-function commandColorBtn(name, title, command, defaultColor) {
+function commandColorBtn(name: IconName, title: string, command: string, defaultColor: string) {
   const btn = colorBtn(ICONS[name], title, defaultColor, (color) => {
     restoreRange();
     document.execCommand(command, false, color);
@@ -510,8 +546,9 @@ const textColorBtn = commandColorBtn("textcolor", "Text color", "foreColor", "#1
 const highlightBtn = commandColorBtn("highlight", "Highlight color", "hiliteColor", "#fff3a3");
 
 // Alignment segmented control
-const alignBtns = {};
-function alignBtn(name, title, command) {
+// Filled by the four calls below; typed as complete so the toolbar state can read each.
+const alignBtns = {} as Record<"left" | "center" | "right" | "justify", HTMLButtonElement>;
+function alignBtn(name: IconName, title: string, command: string) {
   return segBtn(ICONS[name], title, () => {
     document.execCommand(command, false, null);
     editor.focus();
@@ -572,56 +609,56 @@ const app = el("div", { class: "app" }, [topbar, toolbar, canvas]);
 document.body.appendChild(app);
 
 // --- Selection helpers -----------------------------------------------------
-let savedRange = null;
-function getRange() {
+let savedRange: Range | null = null;
+function getRange(): Range | null {
   const sel = window.getSelection();
   if (sel && sel.rangeCount && editor.contains(sel.anchorNode)) return sel.getRangeAt(0).cloneRange();
   return null;
 }
 function restoreRange() {
   if (!savedRange) return;
-  const sel = window.getSelection();
+  const sel = window.getSelection()!;
   sel.removeAllRanges();
   sel.addRange(savedRange);
 }
-function currentBlock() {
+function currentBlock(): Element | null {
   const sel = window.getSelection();
   if (!sel || !sel.rangeCount) return null;
   let node = sel.anchorNode;
   while (node && node !== editor) {
-    if (node.nodeType === 1 && /^(P|H1|H2|H3|H4|BLOCKQUOTE|PRE|LI|DIV)$/.test(node.tagName)) return node;
+    if (isElement(node) && /^(P|H1|H2|H3|H4|BLOCKQUOTE|PRE|LI|DIV)$/.test(node.tagName)) return node;
     node = node.parentNode;
   }
   return null;
 }
 
 // The <a> element containing the current selection, if any.
-function currentLink() {
+function currentLink(): Element | null {
   const sel = window.getSelection();
   if (!sel || !sel.rangeCount) return null;
   let node = sel.anchorNode;
   while (node && node !== editor) {
-    if (node.nodeType === 1 && node.tagName === "A") return node;
+    if (isElement(node) && node.tagName === "A") return node;
     node = node.parentNode;
   }
   return null;
 }
 
-function selectNode(node) {
+function selectNode(node: Node) {
   const range = document.createRange();
   range.selectNode(node);
-  const sel = window.getSelection();
+  const sel = window.getSelection()!;
   sel.removeAllRanges();
   sel.addRange(range);
 }
 
-function normalizeHref(url) {
+function normalizeHref(url: string): string {
   let href = (url || "").trim();
   if (href && !/^(https?:|mailto:|tel:|#|\/)/i.test(href)) href = "https://" + href;
   return href;
 }
 
-function escapeAttr(s) {
+function escapeAttr(s: string): string {
   return String(s || "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 }
 
@@ -632,11 +669,11 @@ function escapeAttr(s) {
 // The reading, downscaling and re-encoding is the ui library's; where the image
 // lands in the document is this editor's.
 
-function isSafeImageDataUrl(src) {
+function isSafeImageDataUrl(src: string): boolean {
   return /^data:image\/(png|jpe?g|webp|gif);base64,/i.test(src || "");
 }
 
-function insertImageDataUrl({ src, width, alt }) {
+function insertImageDataUrl({ src, width, alt }: PreparedImage) {
   if (!isSafeImageDataUrl(src)) return;
   restoreRange();
   const displayWidth = Math.min(width || 520, Math.max(240, editor.clientWidth - 40));
@@ -645,7 +682,7 @@ function insertImageDataUrl({ src, width, alt }) {
   savedRange = getRange();
 }
 
-async function insertImageFiles(files) {
+async function insertImageFiles(files: File[]) {
   const imageFiles = files.filter(isImageFile);
   if (!imageFiles.length) return;
   hideLinkPopover();
@@ -663,8 +700,8 @@ async function insertImageFiles(files) {
   }
 }
 
-function setCaretFromPoint(x, y) {
-  let range = null;
+function setCaretFromPoint(x: number, y: number) {
+  let range: Range | null = null;
   if (document.caretRangeFromPoint) {
     range = document.caretRangeFromPoint(x, y);
   } else if (document.caretPositionFromPoint) {
@@ -680,18 +717,18 @@ function setCaretFromPoint(x, y) {
     range.selectNodeContents(editor);
     range.collapse(false);
   }
-  const sel = window.getSelection();
+  const sel = window.getSelection()!;
   sel.removeAllRanges();
   sel.addRange(range);
   savedRange = range.cloneRange();
 }
 
-let selectedImage = null;
+let selectedImage: HTMLImageElement | null = null;
 let resizingImage = false;
-let draggedImage = null;
+let draggedImage: HTMLImageElement | null = null;
 const imageControls = el("div", { class: "image-controls" }, [el("div", { class: "resize-handle" })]);
 document.body.appendChild(imageControls);
-const resizeHandle = imageControls.querySelector(".resize-handle");
+const resizeHandle = imageControls.querySelector<HTMLDivElement>(".resize-handle")!;
 
 function positionImageControls() {
   if (!selectedImage || !editor.contains(selectedImage) || resizingImage) return;
@@ -703,7 +740,7 @@ function positionImageControls() {
   imageControls.style.display = "block";
 }
 
-function selectImage(img) {
+function selectImage(img: HTMLImageElement) {
   if (selectedImage === img) {
     positionImageControls();
     return;
@@ -732,7 +769,7 @@ resizeHandle.addEventListener("mousedown", (e) => {
   const editorWidth = editor.getBoundingClientRect().width;
   imageControls.style.display = "none";
 
-  const move = (ev) => {
+  const move = (ev: MouseEvent) => {
     const next = Math.max(80, Math.min(editorWidth, startWidth + ev.clientX - startX));
     img.style.width = Math.round(next) + "px";
     img.style.height = "auto";
@@ -749,13 +786,13 @@ resizeHandle.addEventListener("mousedown", (e) => {
 });
 
 editor.addEventListener("click", (e) => {
-  const img = e.target.closest && e.target.closest("img.doc-image");
+  const img = e.target instanceof Element && e.target.closest<HTMLImageElement>("img.doc-image");
   if (img && editor.contains(img)) selectImage(img);
   else hideImageControls();
 });
 
 editor.addEventListener("dragstart", (e) => {
-  const img = e.target.closest && e.target.closest("img.doc-image");
+  const img = e.target instanceof Element && e.target.closest<HTMLImageElement>("img.doc-image");
   if (!img || !editor.contains(img)) return;
   draggedImage = img;
   selectImage(img);
@@ -802,7 +839,7 @@ editor.addEventListener("drop", (e) => {
       const after = document.createRange();
       after.setStartAfter(img);
       after.collapse(true);
-      const sel = window.getSelection();
+      const sel = window.getSelection()!;
       sel.removeAllRanges();
       sel.addRange(after);
       savedRange = after.cloneRange();
@@ -827,7 +864,7 @@ editor.addEventListener("drop", (e) => {
     e.preventDefault();
     setCaretFromPoint(e.clientX, e.clientY);
     if (html && html.trim()) document.execCommand("insertHTML", false, sanitizePastedHtml(html));
-    else document.execCommand("insertHTML", false, escapeText(text).replace(/\r?\n/g, "<br>"));
+    else document.execCommand("insertHTML", false, escapeText(text!).replace(/\r?\n/g, "<br>"));
     refreshToolbarState();
     scheduleSave();
   }
@@ -836,7 +873,7 @@ editor.addEventListener("drop", (e) => {
 window.addEventListener("scroll", () => { if (selectedImage) positionImageControls(); }, true);
 window.addEventListener("resize", () => { if (selectedImage) positionImageControls(); });
 
-function sanitizeImageElement(srcImg) {
+function sanitizeImageElement(srcImg: Element): HTMLImageElement | null {
   const src = srcImg.getAttribute("src") || "";
   // Persist only embedded images. External/blob URLs are not reliable after
   // reload in the Gadget sandbox, and blob: URLs vanish immediately.
@@ -856,10 +893,10 @@ function sanitizeImageElement(srcImg) {
 
 // What the link prompt looks like: the sandbox blocks window.prompt, so the ui
 // library's dialog asks instead.
-const LINK_PROMPT = { placeholder: "https://", okLabel: "Insert" };
+const LINK_PROMPT: PromptOptions = { placeholder: "https://", okLabel: "Insert" };
 
 // The link button: edit the link under the cursor if there is one, else create.
-async function insertLink() {
+async function insertLink(): Promise<void> {
   const existing = currentLink();
   if (existing) return editLink(existing);
   savedRange = getRange();
@@ -871,7 +908,7 @@ async function insertLink() {
   scheduleSave();
 }
 
-async function editLink(anchor) {
+async function editLink(anchor: Element): Promise<void> {
   const url = await promptInline("Edit URL:", anchor.getAttribute("href") || "", LINK_PROMPT);
   if (url === null) return;
   selectNode(anchor);
@@ -886,7 +923,7 @@ async function editLink(anchor) {
 }
 
 // Strip the link, keeping its text.
-function removeLink(anchor) {
+function removeLink(anchor: Element) {
   selectNode(anchor);
   document.execCommand("unlink", false, null);
   hideLinkPopover();
@@ -895,7 +932,7 @@ function removeLink(anchor) {
 }
 
 // --- Link popover (Google-Docs style) --------------------------------------
-let activeLink = null;
+let activeLink: Element | null = null;
 const linkPopUrl = el("a", { class: "lp-url", target: "_blank", rel: "noopener noreferrer" });
 const linkPopEdit = el("button", { class: "lp-btn" }, "Edit");
 const linkPopRemove = el("button", { class: "lp-btn lp-danger" }, "Remove link");
@@ -909,7 +946,7 @@ linkPopEdit.addEventListener("click", () => { if (activeLink) editLink(activeLin
 linkPopRemove.addEventListener("click", () => { if (activeLink) removeLink(activeLink); });
 document.body.appendChild(linkPop);
 
-function positionLinkPopover(anchor) {
+function positionLinkPopover(anchor: Element) {
   const r = anchor.getBoundingClientRect();
   linkPop.style.visibility = "hidden";
   linkPop.style.display = "flex";
@@ -923,7 +960,7 @@ function positionLinkPopover(anchor) {
   linkPop.style.visibility = "visible";
 }
 
-function showLinkPopover(anchor) {
+function showLinkPopover(anchor: Element) {
   activeLink = anchor;
   const href = anchor.getAttribute("href") || "";
   linkPopUrl.textContent = href.replace(/^mailto:/i, "");
@@ -952,9 +989,19 @@ window.addEventListener("resize", () => { if (activeLink) positionLinkPopover(ac
 // rebuild pasted HTML into clean semantic markup so it behaves like text the
 // editor created itself.
 const INLINE_ONLY = ["code", "s", "u", "i", "b"];
-function wrapEl(tag, child) { const e = document.createElement(tag); e.appendChild(child); return e; }
+function wrapEl(tag: string, child: Node): HTMLElement { const e = document.createElement(tag); e.appendChild(child); return e; }
 
-function fmtOf(elem, ctx) {
+/** The inline formatting in force where the sanitizer stands in the pasted tree. */
+interface InlineFormat {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strike?: boolean;
+  code?: boolean;
+  link?: string | null;
+}
+
+function fmtOf(elem: Element, ctx: InlineFormat): InlineFormat {
   const cs = ((elem.getAttribute && elem.getAttribute("style")) || "").toLowerCase();
   const tag = elem.tagName;
   const n = Object.assign({}, ctx);
@@ -975,8 +1022,8 @@ function fmtOf(elem, ctx) {
   return n;
 }
 
-function wrapInline(text, ctx) {
-  let node = document.createTextNode(text);
+function wrapInline(text: string, ctx: InlineFormat): Node {
+  let node: Node = document.createTextNode(text);
   if (ctx.code) node = wrapEl("code", node);
   if (ctx.strike) node = wrapEl("s", node);
   if (ctx.underline) node = wrapEl("u", node);
@@ -995,15 +1042,15 @@ function wrapInline(text, ctx) {
 
 const BLOCK_TAGS = ["P", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "PRE", "UL", "OL", "LI", "DIV"];
 
-function sanitizePastedHtml(html) {
+function sanitizePastedHtml(html: string): string {
   const parsed = new DOMParser().parseFromString(html, "text/html");
   const result = document.createElement("div");
 
-  function appendInline(src, target, ctx) {
+  function appendInline(src: Node, target: Node, ctx: InlineFormat) {
     src.childNodes.forEach((child) => {
-      if (child.nodeType === 3) {
+      if (isText(child)) {
         if (child.textContent) target.appendChild(wrapInline(child.textContent, ctx));
-      } else if (child.nodeType === 1) {
+      } else if (isElement(child)) {
         const tag = child.tagName;
         if (tag === "BR") target.appendChild(document.createElement("br"));
         else if (tag === "IMG") {
@@ -1016,17 +1063,17 @@ function sanitizePastedHtml(html) {
     });
   }
 
-  function processList(src, ctx) {
+  function processList(src: Element, ctx: InlineFormat): HTMLElement {
     const list = document.createElement(src.tagName === "OL" ? "ol" : "ul");
     src.childNodes.forEach((child) => {
-      if (child.nodeType !== 1) return;
+      if (!isElement(child)) return;
       if (child.tagName === "LI") {
         const li = document.createElement("li");
-        const nested = [];
+        const nested: Element[] = [];
         child.childNodes.forEach((g) => {
-          if (g.nodeType === 1 && (g.tagName === "UL" || g.tagName === "OL")) nested.push(g);
-          else if (g.nodeType === 3) { if (g.textContent) li.appendChild(wrapInline(g.textContent, ctx)); }
-          else if (g.nodeType === 1) appendInline(g, li, fmtOf(g, ctx));
+          if (isElement(g) && (g.tagName === "UL" || g.tagName === "OL")) nested.push(g);
+          else if (isText(g)) { if (g.textContent) li.appendChild(wrapInline(g.textContent, ctx)); }
+          else if (isElement(g)) appendInline(g, li, fmtOf(g, ctx));
         });
         nested.forEach((n) => li.appendChild(processList(n, ctx)));
         list.appendChild(li);
@@ -1037,9 +1084,9 @@ function sanitizePastedHtml(html) {
     return list;
   }
 
-  function processNodes(nodes, ctx) {
+  function processNodes(nodes: Node[], ctx: InlineFormat) {
     nodes.forEach((node) => {
-      if (node.nodeType === 3) {
+      if (isText(node)) {
         if (node.textContent && node.textContent.trim()) {
           const p = document.createElement("p");
           p.appendChild(wrapInline(node.textContent, ctx));
@@ -1047,7 +1094,7 @@ function sanitizePastedHtml(html) {
         }
         return;
       }
-      if (node.nodeType !== 1) return;
+      if (!isElement(node)) return;
       const tag = node.tagName;
       if (tag === "STYLE" || tag === "SCRIPT" || tag === "META" || tag === "BR") return;
       if (tag === "HR") { result.appendChild(document.createElement("hr")); return; }
@@ -1066,20 +1113,20 @@ function sanitizePastedHtml(html) {
         if (out === "h4" || out === "h5" || out === "h6") out = "h3";
         const block = document.createElement(out);
         appendInline(node, block, ctx);
-        if (block.textContent.trim() || block.querySelector("br")) result.appendChild(block);
+        if (block.textContent!.trim() || block.querySelector("br")) result.appendChild(block);
         return;
       }
       // Wrapper (DIV/SPAN/FONT/B-wrapper…): descend if it holds blocks,
       // otherwise treat its inline content as a paragraph.
       const newCtx = fmtOf(node, ctx);
       const hasBlockChild = Array.from(node.childNodes).some(
-        (c) => c.nodeType === 1 && BLOCK_TAGS.includes(c.tagName));
+        (c) => isElement(c) && BLOCK_TAGS.includes(c.tagName));
       if (hasBlockChild) {
         processNodes(Array.from(node.childNodes), newCtx);
       } else {
         const p = document.createElement("p");
         appendInline(node, p, newCtx);
-        if (p.textContent.trim() || p.querySelector("br")) result.appendChild(p);
+        if (p.textContent!.trim() || p.querySelector("br")) result.appendChild(p);
       }
     });
   }
@@ -1088,7 +1135,7 @@ function sanitizePastedHtml(html) {
   return result.innerHTML;
 }
 
-function escapeText(t) {
+function escapeText(t: string): string {
   return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
@@ -1117,7 +1164,7 @@ editor.addEventListener("paste", (e) => {
 
 // --- Toolbar live state ----------------------------------------------------
 function refreshToolbarState() {
-  const set = (btn, on) => btn.classList.toggle("active", on);
+  const set = (btn: HTMLElement, on: boolean) => btn.classList.toggle("active", on);
   try {
     set(boldBtn, document.queryCommandState("bold"));
     set(italicBtn, document.queryCommandState("italic"));
@@ -1154,7 +1201,7 @@ function scheduleSelectionUpdate() {
   });
 }
 document.addEventListener("selectionchange", () => {
-  if (editor.contains(window.getSelection().anchorNode)) scheduleSelectionUpdate();
+  if (editor.contains(window.getSelection()!.anchorNode)) scheduleSelectionUpdate();
 });
 
 // --- Real-time block collaboration ----------------------------------------
@@ -1175,32 +1222,34 @@ const me = collaboratorFor(clientId);
 let applyingRemote = false;
 let revision = 0;
 let acknowledgedTitle = "Untitled document";
-const acknowledged = new Map(); // id -> {html, version}
-const pendingByBlock = new Map();
-const roster = new PresenceRoster(clientId);
+const acknowledged = new Map<string, { html: string; version: number }>(); // id -> {html, version}
+// A remote change to the block being typed in, held until the caret leaves it.
+type PendingBlock = { type: "upsert"; block: StoredBlock } | { type: "delete" };
+const pendingByBlock = new Map<string, PendingBlock>();
+const roster = new PresenceRoster<DocCursor>(clientId);
 
 // The dot's classes are this stylesheet's. The sync library names a rejected
 // save `conflict` and a failed one `offline`; both are drawn the way this
 // editor has always drawn them.
-const STATUS_KINDS = { conflict: "synced", offline: "bad" };
-function setStatus(kind, text) {
+const STATUS_KINDS: Record<string, string> = { conflict: "synced", offline: "bad" };
+function setStatus(kind: string, text: string) {
   saveStatus.set(STATUS_KINDS[kind] ?? kind, text);
 }
 
 function newBlockId() {
-  if (globalThis.crypto?.randomUUID) return "b_" + crypto.randomUUID();
+  if (typeof globalThis.crypto?.randomUUID === "function") return "b_" + crypto.randomUUID();
   return "b_" + Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
 
-function blockId(node) { return node?.nodeType === 1 ? node.getAttribute("data-block-id") : null; }
-function findBlock(id) {
+function blockId(node: Node | null | undefined): string | null { return isElement(node) ? node.getAttribute("data-block-id") : null; }
+function findBlock(id: string): Element | null {
   return Array.from(editor.children).find((node) => blockId(node) === id) || null;
 }
-function activeBlockId() {
+function activeBlockId(): string | null {
   const sel = window.getSelection();
   let node = sel?.anchorNode;
   if (!node || !editor.contains(node)) return null;
-  if (node.nodeType !== 1) node = node.parentElement;
+  if (!isElement(node)) node = node.parentElement;
   while (node && node.parentElement !== editor) node = node.parentElement;
   return node && node.parentElement === editor ? blockId(node) : null;
 }
@@ -1210,14 +1259,14 @@ function activeBlockId() {
 function normalizeBlocks() {
   const selectionBlock = activeBlockId();
   for (const node of Array.from(editor.childNodes)) {
-    if (node.nodeType === 3 || (node.nodeType === 1 && node.tagName === "BR")) {
+    if (isText(node) || (isElement(node) && node.tagName === "BR")) {
       const p = document.createElement("p");
-      if (node.nodeType === 3) p.textContent = node.textContent;
+      if (isText(node)) p.textContent = node.textContent;
       else p.appendChild(document.createElement("br"));
       editor.replaceChild(p, node);
     }
   }
-  const seen = new Set();
+  const seen = new Set<string>();
   for (const node of Array.from(editor.children)) {
     let id = blockId(node);
     if (!id || seen.has(id)) {
@@ -1232,27 +1281,29 @@ function normalizeBlocks() {
     const node = findBlock(selectionBlock);
     if (node) {
       const range = document.createRange(); range.selectNodeContents(node); range.collapse(false);
-      const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      const sel = window.getSelection()!; sel.removeAllRanges(); sel.addRange(range);
     }
   }
 }
 
-function canonicalBlockHtml(node) {
+function canonicalBlockHtml(node: Element): string {
   // Presence decoration is ephemeral UI and must never enter persisted HTML.
-  const clone = node.cloneNode(true);
+  // A top-level block is always an HTML element: normalizeBlocks() wraps anything else in a <p>.
+  const clone = node.cloneNode(true) as HTMLElement;
   clone.classList.remove("remote-editing");
   clone.style.removeProperty("--remote-color");
-  clone.querySelectorAll(".remote-editing").forEach((child) => {
+  clone.querySelectorAll<HTMLElement>(".remote-editing").forEach((child) => {
     child.classList.remove("remote-editing"); child.style.removeProperty("--remote-color");
   });
   clone.querySelectorAll(".image-selected").forEach((image) => image.classList.remove("image-selected"));
   return clone.outerHTML;
 }
-function serializeBlocks() {
+function serializeBlocks(): BlockContent[] {
   normalizeBlocks();
-  return Array.from(editor.children).map((node) => ({ id: blockId(node), html: canonicalBlockHtml(node) }));
+  // normalizeBlocks() has just given every block an id.
+  return Array.from(editor.children).map((node) => ({ id: blockId(node)!, html: canonicalBlockHtml(node) }));
 }
-function parseBlock(block) {
+function parseBlock(block: BlockContent): Element {
   const tpl = document.createElement("template");
   tpl.innerHTML = block.html;
   const node = tpl.content.firstElementChild || document.createElement("p");
@@ -1264,23 +1315,23 @@ function parseBlock(block) {
 // crosses RPC. Only the payload and what counts as dirty are this gadget's.
 const saver = new SaveScheduler({ save: sendChanges, isDirty, onStatus: setStatus });
 
-function scheduleSave(delay) {
+function scheduleSave(delay?: number) {
   if (applyingRemote) return;
   saver.schedule(delay);
 }
 
-function currentTitle() {
+function currentTitle(): string {
   return titleInput.value.trim() || "Untitled document";
 }
 
-function isDirty() {
+function isDirty(): boolean {
   const blocks = serializeBlocks();
   return blocks.some((block) => acknowledged.get(block.id)?.html !== block.html) ||
     blocks.length !== acknowledged.size ||
     currentTitle() !== acknowledgedTitle;
 }
 
-async function sendChanges() {
+async function sendChanges(): Promise<SaveOutcome> {
   const blocks = serializeBlocks();
   const currentIds = new Set(blocks.map((b) => b.id));
   const upserts = blocks
@@ -1319,7 +1370,7 @@ titleInput.addEventListener("input", () => scheduleSave());
 try { document.execCommand("styleWithCSS", false, true); } catch (e) {}
 try { document.execCommand("defaultParagraphSeparator", false, "p"); } catch (e) {}
 
-function applyOrder(order) {
+function applyOrder(order: string[] | undefined) {
   // Move only nodes that are actually out of place. Re-appending every block
   // would unnecessarily disturb a live Selection in the active block.
   let position = 0;
@@ -1332,7 +1383,7 @@ function applyOrder(order) {
   }
 }
 
-function applyRemoteOperation(event) {
+function applyRemoteOperation(event: OperationEvent) {
   if (!event || event.senderId === clientId) return;
   applyingRemote = true;
   revision = Math.max(revision, event.revision || 0);
@@ -1361,7 +1412,7 @@ function applyRemoteOperation(event) {
   setTimeout(() => { if (!saver.busy) setStatus("saved", "Saved"); }, 900);
 }
 
-function applySnapshot(doc) {
+function applySnapshot(doc: StoredDocument) {
   applyingRemote = true;
   hideLinkPopover(); hideImageControls();
   revision = doc.revision || 0;
@@ -1383,7 +1434,7 @@ function applySnapshot(doc) {
 // If a remote update arrived for the block being typed in, don't clobber the
 // caret. On blur, apply it only when the local block is clean; otherwise the
 // local draft is rebased and sent as the next version.
-function settlePendingBlock(id) {
+function settlePendingBlock(id: string) {
   const pending = pendingByBlock.get(id);
   if (!pending) return;
   pendingByBlock.delete(id);
@@ -1412,14 +1463,14 @@ editor.addEventListener("focusout", () => {
 // --- Ephemeral presence ----------------------------------------------------
 // The roster and the throttled reporter are the sync library's; where a caret
 // sits in a block, and how it is drawn, are this editor's.
-function containingBlock(node) {
+function containingBlock(node: Node | null | undefined): Node | null {
   if (!node || !editor.contains(node)) return null;
-  if (node.nodeType !== 1) node = node.parentElement;
+  if (!isElement(node)) node = node.parentElement;
   if (node === editor) return null;
   while (node && node.parentElement !== editor) node = node.parentElement;
   return node?.parentElement === editor ? node : null;
 }
-function textOffsetForPoint(block, node, offset) {
+function textOffsetForPoint(block: Node | null, node: Node | null | undefined, offset: number): number {
   if (!block || !node) return 0;
   try {
     const range = document.createRange();
@@ -1430,7 +1481,7 @@ function textOffsetForPoint(block, node, offset) {
 }
 // Anchor and focus endpoints let everyone draw both a caret and a selection,
 // including one spanning several top-level blocks.
-function currentPresence() {
+function currentPresence(): PresenceUpdate {
   const sel = window.getSelection();
   const anchorBlock = containingBlock(sel?.anchorNode);
   const focusBlock = containingBlock(sel?.focusNode);
@@ -1443,10 +1494,16 @@ function currentPresence() {
   };
 }
 const presence = new PresenceReporter(currentPresence, (update) => gadget.updatePresence(update));
-function domPointAtTextOffset(block, requestedOffset) {
+/** A place in the DOM: a node and an offset within it, as a Range endpoint. */
+interface DomPoint {
+  node: Node;
+  offset: number;
+}
+function domPointAtTextOffset(block: Element, requestedOffset: number): DomPoint {
   const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
-  let remaining = Math.max(0, requestedOffset || 0), text = null, last = null;
-  while ((text = walker.nextNode())) {
+  let remaining = Math.max(0, requestedOffset || 0), text: Text | null = null, last: Text | null = null;
+  // The walker shows text nodes only.
+  while ((text = walker.nextNode() as Text | null)) {
     last = text;
     if (remaining <= text.data.length) return { node: text, offset: remaining };
     remaining -= text.data.length;
@@ -1454,7 +1511,7 @@ function domPointAtTextOffset(block, requestedOffset) {
   if (last) return { node: last, offset: last.data.length };
   return { node: block, offset: 0 };
 }
-function caretRectAtPoint(block, point) {
+function caretRectAtPoint(block: Element, point: DomPoint): Pick<DOMRect, "left" | "top" | "height"> {
   try {
     const range = document.createRange();
     range.setStart(point.node, point.offset); range.collapse(true);
@@ -1464,7 +1521,7 @@ function caretRectAtPoint(block, point) {
   const r = block.getBoundingClientRect();
   return { left: r.left, top: r.top + 3, height: Math.min(22, Math.max(18, r.height - 6)) };
 }
-function orderedSelectionRange(cursor) {
+function orderedSelectionRange(cursor: DocCursor) {
   const anchorBlock = cursor.anchorBlockId && findBlock(cursor.anchorBlockId);
   const focusBlock = cursor.focusBlockId && findBlock(cursor.focusBlockId);
   if (!anchorBlock || !focusBlock) return null;
@@ -1502,15 +1559,15 @@ function renderPresence() {
       el("span", { class: "remote-caret-label" }, person.name || "Guest"),
     ]);
     caret.style.cssText = `left:${Math.round(r.left)}px;top:${Math.round(r.top)}px;height:${Math.max(18, Math.round(r.height || 18))}px;background:${person.color}`;
-    caret.firstChild.style.background = person.color;
+    (caret.firstChild as HTMLElement).style.background = person.color;
     remoteCaretLayer.appendChild(caret);
   }
 }
-function applyPresence(event) {
+function applyPresence(event: DocPresenceEvent) {
   if (roster.apply(event)) renderPresence();
 }
 document.addEventListener("selectionchange", () => {
-  if (editor.contains(window.getSelection()?.anchorNode)) presence.schedule();
+  if (editor.contains(window.getSelection()?.anchorNode ?? null)) presence.schedule();
 });
 window.addEventListener("scroll", () => { if (roster.entries().length) renderPresence(); }, true);
 window.addEventListener("resize", () => { if (roster.entries().length) renderPresence(); });
@@ -1526,7 +1583,7 @@ window.addEventListener("pagehide", () => {
 });
 
 // The server's callbacks, on the RpcTarget the bootstrap provides.
-const subscriber = createSubscriber(RpcTarget, {
+const subscriber = createSubscriber<SubscriberCallbacks>(RpcTarget, {
   operation(event) {
     if (event.type === "snapshot") applySnapshot(event.document);
     else applyRemoteOperation(event);
