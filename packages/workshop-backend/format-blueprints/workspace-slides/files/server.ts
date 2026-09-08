@@ -79,7 +79,7 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
     const current = await this.state.storage.get<Deck>(STORAGE_KEY);
     if (current) this.redoStack.push(current);
     await this.state.storage.put(STORAGE_KEY, prev);
-    await this.#broadcast(prev);
+    this.#broadcast(prev);
     return true;
   }
 
@@ -89,7 +89,7 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
     const current = await this.state.storage.get<Deck>(STORAGE_KEY);
     if (current) this.undoStack.push(current);
     await this.state.storage.put(STORAGE_KEY, next);
-    await this.#broadcast(next);
+    this.#broadcast(next);
     return true;
   }
 
@@ -239,15 +239,17 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
       this.redoStack = [];
     }
     await this.state.storage.put(STORAGE_KEY, deck);
-    await this.#broadcast(deck);
+    this.#broadcast(deck);
   }
 
-  async #broadcast(deck: Deck): Promise<void> {
+  // Delivery is the registry's: issued at once and never awaited, so a slow or
+  // failing browser holds up neither the save nor the other subscribers.
+  #broadcast(deck: Deck): void {
     const meta: UndoState = {
       canUndo: this.undoStack.length > 0,
       canRedo: this.redoStack.length > 0,
     };
-    await this.subscribers.broadcast(sub => sub.deckChanged(deck, meta));
+    this.subscribers.broadcast(sub => sub.deckChanged(deck, meta));
   }
 }
 

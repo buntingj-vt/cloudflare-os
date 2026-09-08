@@ -172,6 +172,6 @@ export interface GadgetStub {
   initializeBlocksLocked(args: DocumentInit): Promise<StoredDocument>;
   setDocumentLocked(args: DocumentInit): Promise<StoredDocument>;
   applyOperationLocked(operation: Operation): Promise<ApplyOperationResult>;
-  broadcast(event: DocumentEvent): Promise<void>;
-  broadcastPresence(event: DocPresenceEvent): Promise<void>;
+  broadcast(event: DocumentEvent): void;
+  broadcastPresence(event: DocPresenceEvent): void;
 }

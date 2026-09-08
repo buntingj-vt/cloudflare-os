@@ -15,8 +15,11 @@ and export formats unchanged while it adopts the parts it re-implemented.
   one stored, whatever order their RPCs interleave in; a rejection reaches its caller alone.
 - **`SubscriberRegistry<Callbacks, Info>`** -- `add(subscriber, info)` `dup()`s the stub the RPC
   layer delivered, registers `onRpcBroken` cleanup and returns the kept handle; `broadcast(send)`
-  delivers to everyone with per-subscriber failure isolation (a failing subscriber is dropped and
-  disposed, never failing the mutation); `remove(handle)`, `members()`, `size`. Given
+  delivers to everyone at once and never waits: a failing subscriber is dropped and disposed
+  (never failing the mutation), a hung one holds up nothing but itself, and a callback may call back
+  into the object -- read the document, queue a mutation -- without deadlocking on the mutation that
+  is telling it about the last one; deliveries are issued synchronously in call order, so each
+  subscriber hears events in order. `remove(handle)`, `has(handle)`, `members()`, `size`. Given
   `PresenceHooks` -- `join(subscriber, who)` and `leave(subscriber, who)` in the gadget's own
   callback vocabulary -- it seeds a newcomer with everyone already here (all at once; one that
   fails a seed is dropped unannounced), announces the newcomer to all, and announces whoever drops

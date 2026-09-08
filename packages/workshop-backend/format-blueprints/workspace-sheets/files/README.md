@@ -166,11 +166,12 @@ them:
 `gadgets:ui/client` draws the chrome: the element builder, the shared toolbar icons and controls
 (icon and segment buttons, groups, colour pickers, the dropdown behind the number-format menu), the
 in-page prompt that stands in for the `window.prompt` the sandbox blocks, and the save-status dot.
-`gadgets:sync/client` is the browser's half of the collaboration loop: the debounced, serialized,
-retrying save scheduler, the presence roster and heartbeat, and the subscriber object the server
-calls back on. The Durable Object keeps its own mutation queue and subscriber map (see below: its
-broadcasts run outside the queue so a callback may re-enter it). The cell model, the formula engine,
-the grid, the sheet tabs and the exports are this gadget's own.
+`gadgets:sync/client` and `gadgets:sync/server` are the collaboration loop: the debounced,
+serialized, retrying save scheduler, the presence roster and heartbeat, the subscriber object the
+server calls back on, and in the Durable Object the mutation queue and the subscriber registry with
+its presence announcements (whose broadcasts are never awaited, so a callback may re-enter the
+queue). The cell model, the formula engine, the grid, the sheet tabs and the exports are this
+gadget's own.
 
 In the repository the source is TypeScript under `format-blueprints/workspace-sheets/files/`
 (`client.ts`, `server.ts`, `lib/protocol.ts`, `lib/formula.ts`, `lib/xlsx.ts`, `lib/zip.ts`), which the build bundles
@@ -194,10 +195,10 @@ Formula evaluation happens in the browser. The engine caches computed cells, det
 Exports the Durable Object class `Gadget`, which is the authoritative persistence and synchronization layer. It:
 
 - Stores spreadsheet metadata and each sheet's cells in Durable Object storage
-- Serializes mutations and document snapshots through an in-memory queue
+- Serializes mutations and document snapshots through the library's mutation queue
 - Applies per-cell optimistic concurrency using cell versions
 - Uses last-writer-wins semantics for document structure
-- Broadcasts operations and presence events to subscribed clients after the queue releases, best-effort and without awaiting them, so a callback may itself read or write the document and a hung subscriber holds up only its own client
+- Broadcasts operations and presence events through the library's subscriber registry after the queue releases, best-effort and without awaiting them, so a callback may itself read or write the document and a hung subscriber holds up only its own client
 - Sanitizes titles, dimensions, cell contents, references, and formatting
 - Advertises and produces the server-side workbook and CSV exports
 

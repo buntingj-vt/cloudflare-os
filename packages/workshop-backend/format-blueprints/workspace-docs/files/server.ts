@@ -126,7 +126,7 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements GadgetS
       lastModified: now,
     };
     await this.ctx.storage.put("document:v2", current);
-    await this.broadcast({
+    this.broadcast({
       type: "snapshot",
       senderId,
       document: current,
@@ -156,7 +156,7 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements GadgetS
       lastModified: Date.now(),
     };
     await this.ctx.storage.put("document:v2", document);
-    await this.broadcast({ type: "snapshot", senderId, document });
+    this.broadcast({ type: "snapshot", senderId, document });
     return document;
   }
 
@@ -235,7 +235,7 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements GadgetS
       order,
       lastModified: doc.lastModified,
     };
-    await this.broadcast(event);
+    this.broadcast(event);
     return {
       status: operationStatus(true, conflicts),
       ...event,
@@ -264,25 +264,27 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements GadgetS
       focusOffset: Math.max(0, Number(presence.focusOffset || 0)),
       at: Date.now(),
     };
-    await this.broadcastPresence(event);
+    this.broadcastPresence(event);
   }
 
   // Best-effort fast path for pagehide. Clients also expire stale presence via
   // heartbeats because browsers cannot guarantee that unload RPC completes.
   async leavePresence(clientId: string): Promise<void> {
-    await this.broadcastPresence({
+    this.broadcastPresence({
       type: "leave",
       clientId: String(clientId || ""),
       at: Date.now(),
     });
   }
 
-  async broadcast(event: DocumentEvent): Promise<void> {
-    await this.subscribers.broadcast((subscriber) => subscriber.operation(event));
+  // Delivery is the registry's: issued at once and never awaited, so a slow or
+  // failing browser holds up neither the mutation nor the other subscribers.
+  broadcast(event: DocumentEvent): void {
+    this.subscribers.broadcast((subscriber) => subscriber.operation(event));
   }
 
-  async broadcastPresence(event: DocPresenceEvent): Promise<void> {
-    await this.subscribers.broadcast((subscriber) => subscriber.presence(event));
+  broadcastPresence(event: DocPresenceEvent): void {
+    this.subscribers.broadcast((subscriber) => subscriber.presence(event));
   }
 
   async getGoogleDocInfo(): Promise<GoogleDocInfo | null> {

@@ -86,7 +86,8 @@ describe("SubscriberRegistry", () => {
     await settle();
     ada.received.length = 0;
 
-    await registry.broadcast((subscriber) => subscriber.operation({ revision: 2 }));
+    registry.broadcast((subscriber) => subscriber.operation({ revision: 2 }));
+    await settle();
     expect(ada.received).toEqual([{ revision: 2 }, { type: "leave", clientId: "bob" }]);
     expect(registry.members()).toEqual([{ clientId: "ada" }]);
     expect(bob.disposed).toBe(1);
@@ -118,8 +119,9 @@ describe("SubscriberRegistry", () => {
     await settle();
     ada.received.length = 0;
 
-    expect(await registry.remove(handle)).toBe(true);
-    expect(await registry.remove(handle)).toBe(false);
+    expect(registry.remove(handle)).toBe(true);
+    expect(registry.remove(handle)).toBe(false);
+    await settle();
     expect(registry.size).toBe(1);
     expect(bob.disposed).toBe(1);
     expect(ada.received).toEqual([{ type: "leave", clientId: "bob" }]);
@@ -166,7 +168,7 @@ describe("SubscriberRegistry", () => {
     ada.received.length = 0;
 
     const handle = registry.add(bob, { clientId: "bob" });
-    expect(await registry.remove(handle)).toBe(true);
+    expect(registry.remove(handle)).toBe(true);
     await settle();
     expect(ada.received).toEqual([{ type: "leave", clientId: "bob" }]);
     expect(bob.received).toEqual([]);
@@ -180,8 +182,56 @@ describe("SubscriberRegistry", () => {
     registry.add(bob);
     await settle();
     expect(ada.received).toEqual([]);
-    await registry.broadcast((subscriber) => subscriber.operation({ revision: 1 }));
+    registry.broadcast((subscriber) => subscriber.operation({ revision: 1 }));
+    await settle();
     expect(ada.received).toEqual([{ revision: 1 }]);
     expect(registry.size).toBe(1);
+  });
+
+  it("delivers in call order without waiting, so a hung subscriber holds up nobody and a callback may re-enter", async () => {
+    const registry = new SubscriberRegistry<Callbacks, Who>(hooks);
+    const ada = fakeStub();
+    const hung = fakeStub();
+    hung.operation = () => new Promise(() => {});
+    // A callback that calls back into the object: it broadcasts again from inside its delivery.
+    const reentrant = fakeStub();
+    const inner = reentrant.operation.bind(reentrant);
+    reentrant.operation = async (event) => {
+      await inner(event);
+      if (event.revision === 1) registry.broadcast((subscriber) => subscriber.operation({ revision: 2 }));
+    };
+    registry.add(ada, { clientId: "ada" });
+    registry.add(hung, { clientId: "hung" });
+    registry.add(reentrant, { clientId: "re" });
+    await settle();
+    ada.received.length = 0;
+    reentrant.received.length = 0;
+
+    // Returns at once: nothing here waits on `hung`.
+    registry.broadcast((subscriber) => subscriber.operation({ revision: 1 }));
+    expect(ada.received).toEqual([{ revision: 1 }]);
+    await settle();
+    expect(ada.received).toEqual([{ revision: 1 }, { revision: 2 }]);
+    expect(reentrant.received).toEqual([{ revision: 1 }, { revision: 2 }]);
+    expect(registry.size).toBe(3);
+    expect(hung.disposed).toBe(0);
+  });
+
+  it("drops a subscriber whose callback throws synchronously, like one whose promise rejects", async () => {
+    const registry = new SubscriberRegistry<Callbacks, Who>(hooks);
+    const ada = fakeStub();
+    const thrower = fakeStub();
+    thrower.operation = () => { throw new Error("sync failure"); };
+    registry.add(ada, { clientId: "ada" });
+    registry.add(thrower, { clientId: "thrower" });
+    await settle();
+    ada.received.length = 0;
+
+    registry.broadcast((subscriber) => subscriber.operation({ revision: 1 }));
+    await settle();
+    expect(registry.has(thrower)).toBe(false);
+    expect(registry.has(ada)).toBe(true);
+    expect(thrower.disposed).toBe(1);
+    expect(ada.received).toEqual([{ revision: 1 }, { type: "leave", clientId: "thrower" }]);
   });
 });

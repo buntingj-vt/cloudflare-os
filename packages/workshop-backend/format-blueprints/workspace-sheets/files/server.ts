@@ -1,4 +1,5 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { MutationQueue, SubscriberRegistry } from "gadgets:sync/server";
 import { workbookToXlsx } from "./lib/xlsx.ts";
 import type {
   Cell,
@@ -21,15 +22,6 @@ import type {
   SheetsPresenceEvent,
   SubscriberCallbacks,
 } from "./lib/protocol.ts";
-
-// A subscribed client as this object holds it: its callbacks, seen through the Workers RPC stub
-// that delivered them, plus what the RPC layer adds -- the `dup` that keeps the stub past the call
-// it arrived in, the disconnection hook, and the disposer that releases it.
-interface SubscriberStub extends SubscriberCallbacks {
-  dup(): SubscriberStub;
-  onRpcBroken(handler: (error: unknown) => void): void;
-  [Symbol.dispose](): void;
-}
 
 // What `applyOperationLocked` hands back: the caller's reply, and the event to broadcast when
 // anything changed.
@@ -63,23 +55,22 @@ const DEFAULT_COLS = 26;
 // is last-writer-wins metadata applied wholesale when a client sends it.
 // ---------------------------------------------------------------------------
 export class Gadget extends DurableObject<unknown, unknown> {
-  declare subscribers: Map<SubscriberStub, CollaboratorInfo>;
-  declare mutationQueue: Promise<unknown>;
+  declare subscribers: SubscriberRegistry<SubscriberCallbacks, CollaboratorInfo>;
+  declare mutations: MutationQueue;
 
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
     this.ctx = ctx;
-    this.subscribers = new Map();
+    // Presence is announced in this gadget's own callback vocabulary: who arrived, and the bare id
+    // of whoever dropped out.
+    this.subscribers = new SubscriberRegistry({
+      join: (subscriber, who) => subscriber.presence({ type: "join", clientId: who.clientId, name: who.name, color: who.color }),
+      leave: (subscriber, who) => subscriber.presence({ type: "leave", clientId: who.clientId }),
+    });
     // Overlapping RPC calls are serialized so each observes/commits one
-    // authoritative state in strict order. Callbacks to subscribers run
-    // outside the queue, so a callback may itself read or write the document.
-    this.mutationQueue = Promise.resolve();
-  }
-
-  enqueueMutation<T>(fn: () => Promise<T> | T): Promise<T> {
-    const result = this.mutationQueue.then(fn);
-    this.mutationQueue = result.catch(() => {});
-    return result;
+    // authoritative state in strict order. Callbacks to subscribers are never
+    // awaited (see the registry), so a callback may itself read or write the document.
+    this.mutations = new MutationQueue();
   }
 
   newId(): string {
@@ -122,11 +113,11 @@ export class Gadget extends DurableObject<unknown, unknown> {
   }
 
   getDocument(): Promise<SheetsDocument> {
-    return this.enqueueMutation(async () => this.assembleDocument(await this.loadMeta()));
+    return this.mutations.run(async () => this.assembleDocument(await this.loadMeta()));
   }
 
   async applyOperation(operation: Operation): Promise<OperationResult> {
-    const { result, event } = await this.enqueueMutation(() => this.applyOperationLocked(operation));
+    const { result, event } = await this.mutations.run(() => this.applyOperationLocked(operation));
     // Issued after the queue releases, so callbacks may re-enter it, but
     // synchronously here, before the next queued mutation can reach storage,
     // so each subscriber still receives events in revision order.
@@ -253,7 +244,7 @@ export class Gadget extends DurableObject<unknown, unknown> {
   }
 
   // --- Presence & subscription ------------------------------------------
-  async subscribe(callback: SubscriberStub, client: Partial<CollaboratorInfo> = {}): Promise<SheetsDocument> {
+  async subscribe(callback: SubscriberCallbacks, client: Partial<CollaboratorInfo> = {}): Promise<SheetsDocument> {
     const info: CollaboratorInfo = {
       clientId: String(client.clientId || ""),
       name: String(client.name || "Guest").slice(0, 40),
@@ -261,25 +252,12 @@ export class Gadget extends DurableObject<unknown, unknown> {
     };
     // Registering and snapshotting inside the queue means the subscriber sees
     // every operation committed after its snapshot, and none before it. The
-    // callback is duplicated only once the snapshot exists, so a failed read
-    // leaves nothing to dispose.
-    return this.enqueueMutation(async () => {
+    // registry duplicates the callback only once the snapshot exists, so a
+    // failed read leaves nothing to dispose; it then seeds the newcomer with
+    // everyone here and announces it, after this call has returned.
+    return this.mutations.run(async () => {
       const document = await this.assembleDocument(await this.loadMeta());
-      const existing = Array.from(this.subscribers.values());
-      const dup = callback.dup();
-      this.subscribers.set(dup, info);
-      dup.onRpcBroken(() => {
-        this.dropSubscriber(dup);
-        this.broadcastPresence({ type: "leave", clientId: info.clientId });
-      });
-      queueMicrotask(async () => {
-        for (const person of existing) {
-          try {
-            await dup.presence({ type: "join", clientId: person.clientId, name: person.name, color: person.color });
-          } catch (e) { break; }
-        }
-        this.broadcastPresence({ type: "join", clientId: info.clientId, name: info.name, color: info.color });
-      });
+      this.subscribers.add(callback, info);
       return document;
     });
   }
@@ -301,22 +279,15 @@ export class Gadget extends DurableObject<unknown, unknown> {
     this.broadcastPresence({ type: "leave", clientId: String(clientId || ""), at: Date.now() });
   }
 
-  dropSubscriber(stub: SubscriberStub): void {
-    if (this.subscribers.delete(stub)) stub[Symbol.dispose]();
-  }
-
-  // Delivery is best-effort and not awaited: a callback that fails is dropped,
-  // and one that never settles holds up nothing but its own client.
+  // Delivery is the registry's: best-effort and not awaited, so a callback
+  // that fails is dropped, and one that never settles holds up nothing but
+  // its own client.
   broadcast(event: OperationEvent): void {
-    for (const [stub] of this.subscribers) {
-      Promise.resolve(stub.operation(event)).catch(() => this.dropSubscriber(stub));
-    }
+    this.subscribers.broadcast((each) => each.operation(event));
   }
 
   broadcastPresence(event: SheetsPresenceEvent): void {
-    for (const [stub] of this.subscribers) {
-      Promise.resolve(stub.presence(event)).catch(() => this.dropSubscriber(stub));
-    }
+    this.subscribers.broadcast((each) => each.presence(event));
   }
 }
 

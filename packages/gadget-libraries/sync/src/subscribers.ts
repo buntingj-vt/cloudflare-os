@@ -4,9 +4,13 @@
  * A subscriber arrives as the client's `RpcTarget`, seen from here through a Workers RPC stub that
  * is only valid for the call that delivered it. Keeping it means `dup()`-ing it, and dropping it
  * means disposing that copy; the runtime's `onRpcBroken` says when the connection behind it went
- * away. Delivery isolates subscribers from each other: one whose call fails is dropped rather than
- * failing the mutation that was being broadcast, and the rest are told it left -- exactly as they
- * would be had its connection closed.
+ * away. Delivery isolates subscribers from each other and from the object: a broadcast is issued to
+ * everyone at once and never awaited, so one whose call fails is dropped rather than failing the
+ * mutation that was being broadcast (and the rest are told it left, exactly as they would be had
+ * its connection closed), one that never answers holds up nothing but itself, and a callback may
+ * itself call back into the object -- read the document, queue another mutation -- without
+ * deadlocking on the mutation that is telling it about the last one. Because deliveries are issued
+ * synchronously, in call order, each subscriber still hears events in the order they were sent.
  *
  * Presence is the one thing the registry knows how to say itself, through the optional
  * {@link PresenceHooks}: a newcomer is first told about everyone already here, then announced to
@@ -57,6 +61,11 @@ export class SubscriberRegistry<Callbacks extends object, Info = void> {
     return this.#subscribers.size;
   }
 
+  /** Whether `subscriber` -- the handle {@link add} returned -- is still registered. */
+  has(subscriber: Callbacks): boolean {
+    return this.#subscribers.has(subscriber as Callbacks & SubscriberStub);
+  }
+
   /** What each subscriber said about itself, in order of arrival. */
   members(): Info[] {
     return Array.from(this.#subscribers.values());
@@ -75,7 +84,7 @@ export class SubscriberRegistry<Callbacks extends object, Info = void> {
     const others = this.members();
     this.#subscribers.set(stub, who);
     stub.onRpcBroken(() => {
-      if (this.#drop(stub)) void this.#announceLeave([who]);
+      if (this.#drop(stub)) this.#announceLeave(who);
     });
     const presence = this.#presence;
     if (presence) {
@@ -86,7 +95,7 @@ export class SubscriberRegistry<Callbacks extends object, Info = void> {
         const seeds = await Promise.allSettled(others.map((person) => Promise.resolve().then(() => presence.join(stub, person))));
         if (seeds.some((seed) => seed.status === "rejected")) this.#drop(stub);
         if (!this.#subscribers.has(stub)) return;
-        await this.broadcast((each) => presence.join(each, who));
+        this.broadcast((each) => presence.join(each, who));
       });
     }
     return stub;
@@ -96,38 +105,45 @@ export class SubscriberRegistry<Callbacks extends object, Info = void> {
    * Forget a subscriber before its connection breaks, release its stub and announce that it left.
    * Returns whether it was registered.
    */
-  async remove(subscriber: Callbacks): Promise<boolean> {
+  remove(subscriber: Callbacks): boolean {
     const stub = subscriber as Callbacks & SubscriberStub;
     const who = this.#subscribers.get(stub) as Info;
     if (!this.#drop(stub)) return false;
-    await this.#announceLeave([who]);
+    this.#announceLeave(who);
     return true;
   }
 
   /**
-   * Deliver to every subscriber at once. One whose call rejects is dropped rather than failing the
-   * caller, and the rest are told it left. Resolves once every delivery has settled.
+   * Deliver to every subscriber at once, without waiting for any of them: each `send` is called
+   * synchronously, here, and what it returns is watched rather than awaited. One whose call throws
+   * or rejects is dropped rather than failing the caller, and the rest are told it left; one that
+   * never settles holds up nothing but its own client. A caller that broadcasts from inside its
+   * mutation queue therefore neither blocks the queue on a slow browser nor deadlocks when a
+   * callback re-enters it.
    */
-  async broadcast(send: (subscriber: Callbacks) => unknown): Promise<void> {
-    const gone: Info[] = [];
-    await Promise.all(
-      Array.from(this.#subscribers.keys(), (stub) =>
-        Promise.resolve()
-          .then(() => send(stub))
-          .catch(() => {
-            const who = this.#subscribers.get(stub) as Info;
-            if (this.#drop(stub)) gone.push(who);
-          }),
-      ),
-    );
-    if (gone.length) await this.#announceLeave(gone);
+  broadcast(send: (subscriber: Callbacks) => unknown): void {
+    for (const stub of Array.from(this.#subscribers.keys())) {
+      let delivery: unknown;
+      try {
+        delivery = send(stub);
+      } catch {
+        this.#dropAndAnnounce(stub);
+        continue;
+      }
+      Promise.resolve(delivery).catch(() => this.#dropAndAnnounce(stub));
+    }
   }
 
-  /** Tell everyone still here that each of `gone` left, when there is a vocabulary to say it in. */
-  async #announceLeave(gone: Info[]): Promise<void> {
+  /** Drop a subscriber whose delivery failed and, when it was still here, tell the rest it left. */
+  #dropAndAnnounce(stub: Callbacks & SubscriberStub): void {
+    const who = this.#subscribers.get(stub) as Info;
+    if (this.#drop(stub)) this.#announceLeave(who);
+  }
+
+  /** Tell everyone still here that `who` left, when there is a vocabulary to say it in. */
+  #announceLeave(who: Info): void {
     const presence = this.#presence;
-    if (!presence) return;
-    for (const who of gone) await this.broadcast((each) => presence.leave(each, who));
+    if (presence) this.broadcast((each) => presence.leave(each, who));
   }
 
   /**
