@@ -16,7 +16,16 @@
  *    - draggable + resizable blocks with inline editable text
  *
  *  Present mode (F) hides all chrome and fills the viewport.
+ *
+ *  The element builder, the two image-reading steps and the subscriber
+ *  `RpcTarget` come from the shared `ui` and `sync` libraries, which
+ *  `gadget.json` pins to the deployment's bundles. Everything below them —
+ *  the design tokens, the COMPONENTS registry, the slide renderer and the
+ *  builder shell — is this deck's own.
  * ========================================================================= */
+
+import { el, loadImage, readFileAsDataURL } from "gadgets:ui/client";
+import { createSubscriber } from "gadgets:sync/client";
 
 /* ----------------------- Design tokens ----------------------------------- */
 const C = {
@@ -86,29 +95,11 @@ let canRedo         = false;
 const stageRef = { el: null, wrap: null };
 const shellRef = {};
 
-/* ----------------------- DOM helpers ------------------------------------- */
-function el(tag, props = {}, children = []) {
-  const e = document.createElement(tag);
-  for (const k in props) {
-    const v = props[k];
-    if (v == null) continue;
-    if (k === "style") Object.assign(e.style, v);
-    else if (k === "class") e.className = v;
-    else if (k === "html") e.innerHTML = v;
-    else if (k === "text") e.textContent = v;
-    else if (k === "data") Object.assign(e.dataset, v);
-    else if (k.startsWith("on") && typeof v === "function")
-      e.addEventListener(k.slice(2).toLowerCase(), v);
-    else e.setAttribute(k, v);
-  }
-  for (const c of (children || [])) {
-    if (c == null || c === false) continue;
-    if (typeof c === "string" || typeof c === "number")
-      e.appendChild(document.createTextNode(String(c)));
-    else e.appendChild(c);
-  }
-  return e;
-}
+/* ----------------------- DOM helpers -------------------------------------
+ *
+ * `el` is the ui library's element builder. The SVG helpers below stay here:
+ * slide components draw into the SVG namespace, which the library's HTML-only
+ * builder does not reach. */
 function svg(tag, attrs = {}, children = []) {
   const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
   for (const k in attrs) {
@@ -2368,26 +2359,13 @@ function colorField(label, value, cb) {
 const MAX_IMAGE_DIM       = 1600;
 const IMAGE_DOWNSCALE_MIN = 400_000;  // bytes — below this we keep the original
 
-async function readFileAsDataURL(file) {
-  return await new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload  = () => res(r.result);
-    r.onerror = () => rej(r.error || new Error("read failed"));
-    r.readAsDataURL(file);
-  });
-}
-
-async function loadImage(src) {
-  return await new Promise((res, rej) => {
-    const img = new Image();
-    img.onload  = () => res(img);
-    img.onerror = () => rej(new Error("decode failed"));
-    img.src = src;
-  });
-}
-
 /* Convert a File to a data URL, downscaling raster images larger than
- * MAX_IMAGE_DIM on the longest side. SVG goes through verbatim. */
+ * MAX_IMAGE_DIM on the longest side. SVG goes through verbatim.
+ *
+ * `readFileAsDataURL` and `loadImage` are the ui library's; the encoding rule
+ * is the deck's own, because a slide keeps a PNG a PNG (a chart's transparency
+ * matters more here than the last few kilobytes) and falls back to the file as
+ * uploaded whenever the canvas cannot re-encode it. */
 async function fileToImageDataURL(file) {
   if (file.type === "image/svg+xml") return await readFileAsDataURL(file);
   const original = await readFileAsDataURL(file);
@@ -2698,7 +2676,7 @@ async function doUndo() {
   if (!canUndo) return;
   try { await gadget.undo(); } catch {}
   // The server will broadcast the new deck state (and updated meta) via
-  // the Subscriber; no local state changes are needed here.
+  // the subscriber; no local state changes are needed here.
 }
 
 async function doRedo() {
@@ -3960,7 +3938,10 @@ function attachSlideDragHandlers(row, list, i) {
 
 /* ====================== Realtime ========================================= */
 
-class Subscriber extends RpcTarget {
+/* The object the Durable Object calls back. The sync library builds it over
+ * the bootstrap's RpcTarget, so the callback lands on the prototype, which is
+ * the only place the RPC layer looks. */
+const subscriber = () => createSubscriber(RpcTarget, {
   deckChanged(newDeck, meta) {
     // The server passes `{canUndo, canRedo}` as a second arg; refresh
     // the button state alongside the rest of the UI. (Old/missing meta
@@ -3987,8 +3968,8 @@ class Subscriber extends RpcTarget {
         selectedBlockId = null;
     }
     render(); renderSlideList(); renderInspector(); updateCounter();
-  }
-}
+  },
+});
 
 /* ====================== Boot ============================================= */
 
@@ -3996,7 +3977,7 @@ class Subscriber extends RpcTarget {
   try {
     deck = (await gadget.getDeck()) || { slides: [] };
   } catch (e) { deck = { slides: [] }; }
-  try { await gadget.subscribe(new Subscriber()); } catch (e) {}
+  try { await gadget.subscribe(subscriber()); } catch (e) {}
   mountShell();
   updateCounter();
   render();

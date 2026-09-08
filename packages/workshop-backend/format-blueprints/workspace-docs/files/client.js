@@ -1,6 +1,35 @@
 // ---------------------------------------------------------------------------
 // Docs — a Google-Docs-style editor. Builds the entire UI in JS.
+//
+// Built on the deployment's shared gadget libraries: `ui` draws the
+// chrome (elements, icons, toolbar controls, the prompt, the status dot, image
+// downscaling) and `sync` runs the collaboration loop (save scheduling,
+// presence, the callback target). The editing commands, the paste sanitizer,
+// the block model and the export are this gadget's own.
 // ---------------------------------------------------------------------------
+
+import {
+  ICONS as UI_ICONS,
+  PROMPT_STYLES,
+  colorBtn,
+  customSelect,
+  el,
+  group,
+  iconBtn,
+  imageFilesFrom,
+  isImageFile,
+  prepareImage,
+  promptInline,
+  segBtn,
+  statusIndicator,
+} from "gadgets:ui/client";
+import {
+  PresenceReporter,
+  PresenceRoster,
+  SaveScheduler,
+  collaboratorFor,
+  createSubscriber,
+} from "gadgets:sync/client";
 
 const clientId = Math.random().toString(36).slice(2);
 const isDocumentExport = ["html", "pdf"].includes(globalThis.gadgetExportFormatId);
@@ -345,133 +374,43 @@ html.document-export .doc-page img.doc-image.image-selected { outline: none; }
   .doc-page img.doc-image { cursor: default; }
   .doc-page img.doc-image.image-selected { outline: none; }
 }
-`;
+${PROMPT_STYLES}`;
 document.head.appendChild(style);
 
-// --- Icon helper -----------------------------------------------------------
-function icon(paths) {
-  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
-}
+// --- Icons -----------------------------------------------------------------
+// The shared table, plus the icons only this editor draws.
 const ICONS = {
-  undo: '<path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H9"/>',
-  redo: '<path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H15"/>',
-  bold: '<path d="M6 4h7a4 4 0 0 1 0 8H6z"/><path d="M6 12h8a4 4 0 0 1 0 8H6z"/>',
-  italic: '<line x1="19" y1="4" x2="10" y2="4"/><line x1="14" y1="20" x2="5" y2="20"/><line x1="15" y1="4" x2="9" y2="20"/>',
-  underline: '<path d="M6 3v7a6 6 0 0 0 12 0V3"/><line x1="4" y1="21" x2="20" y2="21"/>',
-  strike: '<path d="M16 4H9a3 3 0 0 0-2.83 4"/><path d="M14 12a4 4 0 0 1 0 8H6"/><line x1="4" y1="12" x2="20" y2="12"/>',
-  textcolor: '<path d="M4 20h16"/><path d="M7 16l5-12 5 12"/><path d="M9 11h6"/>',
+  ...UI_ICONS,
   highlight: '<path d="M9 11l-4 4v3h3l4-4"/><path d="M13 7l4 4"/><path d="M11 9l5-5 4 4-5 5z"/>',
-  alignLeft: '<line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="14" y2="12"/><line x1="4" y1="18" x2="18" y2="18"/>',
-  alignCenter: '<line x1="4" y1="6" x2="20" y2="6"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="5" y1="18" x2="19" y2="18"/>',
-  alignRight: '<line x1="4" y1="6" x2="20" y2="6"/><line x1="10" y1="12" x2="20" y2="12"/><line x1="6" y1="18" x2="20" y2="18"/>',
   alignJustify: '<line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/>',
-  ul: '<line x1="9" y1="6" x2="20" y2="6"/><line x1="9" y1="12" x2="20" y2="12"/><line x1="9" y1="18" x2="20" y2="18"/><circle cx="4.5" cy="6" r="1.2" fill="currentColor"/><circle cx="4.5" cy="12" r="1.2" fill="currentColor"/><circle cx="4.5" cy="18" r="1.2" fill="currentColor"/>',
-  ol: '<line x1="10" y1="6" x2="20" y2="6"/><line x1="10" y1="12" x2="20" y2="12"/><line x1="10" y1="18" x2="20" y2="18"/><path d="M4 10V5L2.7 6" stroke-width="1.5"/><path d="M3 14.5c.4-.6 2-.6 2 .5s-2 1.4-2 2.5h2.2" stroke-width="1.5"/>',
   outdent: '<line x1="20" y1="6" x2="4" y2="6"/><line x1="20" y1="18" x2="4" y2="18"/><line x1="20" y1="12" x2="11" y2="12"/><polyline points="7 9 4 12 7 15"/>',
   indent: '<line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="18" x2="20" y2="18"/><line x1="13" y1="12" x2="20" y2="12"/><polyline points="6 9 9 12 6 15"/>',
-  link: '<path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/>',
   hr: '<line x1="4" y1="12" x2="20" y2="12"/>',
-  clear: '<path d="M4 7V5h12v2"/><path d="M9 5l-2 14"/><line x1="14" y1="13" x2="20" y2="19"/><line x1="20" y1="13" x2="14" y2="19"/>',
-  image: '<rect x="4" y="5" width="16" height="14" rx="2"/><circle cx="8.5" cy="9.5" r="1.4"/><path d="M20 15l-4.5-4.5L7 19"/><path d="M13 19l-3.2-3.2"/>',
 };
-
-// --- DOM helpers -----------------------------------------------------------
-function el(tag, props = {}, children = []) {
-  const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(props)) {
-    if (k === "class") node.className = v;
-    else if (k === "html") node.innerHTML = v;
-    else if (k.startsWith("on")) node.addEventListener(k.slice(2).toLowerCase(), v);
-    else if (v !== null && v !== undefined) node.setAttribute(k, v);
-  }
-  for (const c of [].concat(children)) {
-    if (c) node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-  }
-  return node;
-}
 
 // --- Build UI --------------------------------------------------------------
 const editor = el("div", { class: "doc-page", contenteditable: "true", spellcheck: "true" });
 
 const titleInput = el("input", { class: "title-input", value: "Untitled document", "aria-label": "Document title" });
-const statusDot = el("span", { class: "dot saved" });
-const statusText = el("span", {}, "Saved");
+const saveStatus = statusIndicator({ title: "Save status" });
 
 const topbar = el("div", { class: "topbar" }, [
   el("div", { class: "title-wrap" }, [titleInput]),
   el("div", { class: "spacer" }),
-  el("div", { class: "status", title: "Save status" }, [statusDot, statusText]),
+  saveStatus.element,
 ]);
 
-// Toolbar
-function iconBtn(name, title, onClick) {
-  const b = el("button", { class: "icon-btn", title, html: icon(ICONS[name]) });
-  b.addEventListener("mousedown", (e) => e.preventDefault());
-  b.addEventListener("click", onClick);
-  return b;
-}
-
-// A toolbar group. `prio` (p1/p2/p3 or null) controls when it collapses on
-// narrow screens — null groups always stay visible. The leading divider is
-// part of the group so it hides together with the group.
-function group(prio, items, first = false) {
-  const children = first ? [] : [el("div", { class: "tdiv" })];
-  children.push(...items);
-  return el("div", { class: "tgroup" + (prio ? " " + prio : "") }, children);
-}
-
-// Custom dropdown matching the app's design. `options` is [{value,label,style?}].
-const chevSvg = icon('<polyline points="6 9 12 15 18 9"/>');
-function customSelect({ className, title, options, value, onChange }) {
-  let current;
-  const labelSpan = el("span", { class: "cs-label" });
-  const btn = el("button", { type: "button", class: "cselect " + (className || ""), title }, [
-    labelSpan, el("span", { class: "cs-chev", html: chevSvg }),
-  ]);
-  const menu = el("div", { class: "cmenu" });
-  const items = options.map((o) => {
-    const item = el("div", { class: "cmenu-item", "data-value": String(o.value) }, o.label);
-    if (o.style) item.style.cssText += o.style;
-    item.addEventListener("mousedown", (e) => e.preventDefault());
-    item.addEventListener("click", () => { closeMenu(); setValue(o.value); onChange(o.value); });
-    menu.appendChild(item);
-    return item;
-  });
-  let open = false;
-
-  function setValue(v) {
-    if (v === current) return;          // skip redundant DOM work on hot path
-    current = v;
-    const opt = options.find((o) => o.value === v) || options[0];
-    labelSpan.textContent = opt ? opt.label : "";
-    items.forEach((it) => it.classList.toggle("sel", it.dataset.value === String(v)));
-  }
-  function openMenu() {
-    const r = btn.getBoundingClientRect();
-    menu.style.left = Math.round(r.left) + "px";
-    menu.style.top = Math.round(r.bottom + 4) + "px";
-    menu.style.minWidth = Math.round(r.width) + "px";
-    document.body.appendChild(menu);
-    open = true; btn.classList.add("open");
-  }
-  function closeMenu() {
-    if (menu.parentNode) menu.parentNode.removeChild(menu);
-    open = false; btn.classList.remove("open");
-  }
-  btn.addEventListener("mousedown", (e) => { e.preventDefault(); savedRange = getRange(); });
-  btn.addEventListener("click", () => { open ? closeMenu() : openMenu(); });
-  document.addEventListener("mousedown", (e) => {
-    if (open && !menu.contains(e.target) && !btn.contains(e.target)) closeMenu();
-  });
-  window.addEventListener("scroll", () => { if (open) closeMenu(); }, true);
-  window.addEventListener("resize", () => { if (open) closeMenu(); });
-
-  setValue(value);
-  return { el: btn, setValue, getValue: () => current };
+// Toolbar. A dropdown must leave the editor's selection alone: the mousedown
+// that opens it may not move focus out of the editor, and the range the caret
+// had is what the chosen command applies to.
+function toolbarSelect(options) {
+  const select = customSelect(options);
+  select.el.addEventListener("mousedown", (e) => { e.preventDefault(); savedRange = getRange(); });
+  return select;
 }
 
 // Style selector
-const styleSel = customSelect({
+const styleSel = toolbarSelect({
   className: "style-sel", title: "Paragraph style",
   options: [
     { value: "P", label: "Normal text" },
@@ -500,7 +439,7 @@ const styleSel = customSelect({
 });
 
 // Font family
-const fontSel = customSelect({
+const fontSel = toolbarSelect({
   className: "font-sel", title: "Font",
   options: [
     ["Sans serif", "ui-sans-serif, system-ui, Inter, sans-serif"],
@@ -520,7 +459,7 @@ const fontSel = customSelect({
 });
 
 // Font size
-const sizeSel = customSelect({
+const sizeSel = toolbarSelect({
   className: "size-sel", title: "Font size",
   options: [11, 12, 13, 14, 16, 18, 20, 24, 28, 32, 40, 48].map((s) => ({ value: s, label: String(s) })),
   value: 16,
@@ -542,7 +481,7 @@ function applyFontSize(px) {
 
 // Simple command buttons
 function cmdBtn(name, title, command, value = null) {
-  return iconBtn(name, title, () => {
+  return iconBtn(ICONS[name], title, () => {
     document.execCommand(command, false, value);
     editor.focus();
     refreshToolbarState();
@@ -555,46 +494,35 @@ const italicBtn = cmdBtn("italic", "Italic (Ctrl+I)", "italic");
 const underlineBtn = cmdBtn("underline", "Underline (Ctrl+U)", "underline");
 const strikeBtn = cmdBtn("strike", "Strikethrough", "strikeThrough");
 
-// Color buttons (text + highlight)
-function colorBtn(name, title, command, defaultColor) {
-  const bar = el("span", { class: "bar" });
-  bar.style.background = defaultColor;
-  const input = el("input", { type: "color", value: defaultColor });
-  const btn = el("div", { class: "color-btn", title }, [
-    el("span", { html: icon(ICONS[name]) }),
-    bar,
-    input,
-  ]);
-  btn.addEventListener("mousedown", (e) => { e.preventDefault(); savedRange = getRange(); });
-  input.addEventListener("input", () => {
-    bar.style.background = input.value;
+// Color buttons (text + highlight). The picker prevents its own mousedown; the
+// selection it recolours is the one saved here.
+function commandColorBtn(name, title, command, defaultColor) {
+  const btn = colorBtn(ICONS[name], title, defaultColor, (color) => {
     restoreRange();
-    document.execCommand(command, false, input.value);
+    document.execCommand(command, false, color);
     editor.focus();
     scheduleSave();
   });
+  btn.addEventListener("mousedown", () => { savedRange = getRange(); });
   return btn;
 }
-const textColorBtn = colorBtn("textcolor", "Text color", "foreColor", "#1d1d20");
-const highlightBtn = colorBtn("highlight", "Highlight color", "hiliteColor", "#fff3a3");
+const textColorBtn = commandColorBtn("textcolor", "Text color", "foreColor", "#1d1d20");
+const highlightBtn = commandColorBtn("highlight", "Highlight color", "hiliteColor", "#fff3a3");
 
 // Alignment segmented control
 const alignBtns = {};
-function segBtn(name, title, command) {
-  const b = el("button", { class: "seg-btn", title, html: icon(ICONS[name]) });
-  b.addEventListener("mousedown", (e) => e.preventDefault());
-  b.addEventListener("click", () => {
+function alignBtn(name, title, command) {
+  return segBtn(ICONS[name], title, () => {
     document.execCommand(command, false, null);
     editor.focus();
     refreshToolbarState();
     scheduleSave();
   });
-  return b;
 }
-alignBtns.left = segBtn("alignLeft", "Align left", "justifyLeft");
-alignBtns.center = segBtn("alignCenter", "Align center", "justifyCenter");
-alignBtns.right = segBtn("alignRight", "Align right", "justifyRight");
-alignBtns.justify = segBtn("alignJustify", "Justify", "justifyFull");
+alignBtns.left = alignBtn("alignLeft", "Align left", "justifyLeft");
+alignBtns.center = alignBtn("alignCenter", "Align center", "justifyCenter");
+alignBtns.right = alignBtn("alignRight", "Align right", "justifyRight");
+alignBtns.justify = alignBtn("alignJustify", "Justify", "justifyFull");
 const alignSegment = el("div", { class: "segment" }, [alignBtns.left, alignBtns.center, alignBtns.right, alignBtns.justify]);
 
 const ulBtn = cmdBtn("ul", "Bulleted list", "insertUnorderedList");
@@ -602,18 +530,18 @@ const olBtn = cmdBtn("ol", "Numbered list", "insertOrderedList");
 const outdentBtn = cmdBtn("outdent", "Decrease indent", "outdent");
 const indentBtn = cmdBtn("indent", "Increase indent", "indent");
 
-const linkBtn = iconBtn("link", "Insert link", () => insertLink());
+const linkBtn = iconBtn(ICONS.link, "Insert link", () => insertLink());
 const imageInput = el("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", multiple: "true" });
 imageInput.style.display = "none";
 document.body.appendChild(imageInput);
-const imageBtn = iconBtn("image", "Insert image", () => {
+const imageBtn = iconBtn(ICONS.image, "Insert image", () => {
   savedRange = getRange();
   imageInput.value = "";
   imageInput.click();
 });
 imageInput.addEventListener("change", () => insertImageFiles(Array.from(imageInput.files || [])));
 const hrBtn = cmdBtn("hr", "Horizontal line", "insertHorizontalRule");
-const clearBtn = iconBtn("clear", "Clear formatting", () => {
+const clearBtn = iconBtn(ICONS.clear, "Clear formatting", () => {
   document.execCommand("removeFormat", false, null);
   const block = currentBlock();
   if (block) block.classList.remove("doc-title");
@@ -623,8 +551,8 @@ const clearBtn = iconBtn("clear", "Clear formatting", () => {
   scheduleSave();
 });
 
-const undoBtn = iconBtn("undo", "Undo (Ctrl+Z)", () => { document.execCommand("undo"); editor.focus(); scheduleSave(); });
-const redoBtn = iconBtn("redo", "Redo (Ctrl+Y)", () => { document.execCommand("redo"); editor.focus(); scheduleSave(); });
+const undoBtn = iconBtn(ICONS.undo, "Undo (Ctrl+Z)", () => { document.execCommand("undo"); editor.focus(); scheduleSave(); });
+const redoBtn = iconBtn(ICONS.redo, "Redo (Ctrl+Y)", () => { document.execCommand("redo"); editor.focus(); scheduleSave(); });
 
 const toolbar = el("div", { class: "toolbar" }, [
   group(null, [undoBtn, redoBtn], true),     // always
@@ -701,64 +629,11 @@ function escapeAttr(s) {
 // Images are embedded as compressed data URLs inside the document HTML. This is
 // the most reliable option in the Gadget sandbox: local drag/drop, file picker,
 // screenshots, and clipboard images all keep working after reload and multi-client sync.
-const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
-const MAX_IMAGE_DIMENSION = 1600;
-const IMAGE_QUALITY = 0.86;
-
-function isImageFile(file) {
-  return file && IMAGE_TYPES.has(file.type);
-}
+// The reading, downscaling and re-encoding is the ui library's; where the image
+// lands in the document is this editor's.
 
 function isSafeImageDataUrl(src) {
   return /^data:image\/(png|jpe?g|webp|gif);base64,/i.test(src || "");
-}
-
-function loadImage(src) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error("Could not load image"));
-    img.src = src;
-  });
-}
-
-function readFileAsDataURL(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error || new Error("Could not read image"));
-    reader.readAsDataURL(file);
-  });
-}
-
-async function fileToImageDataUrl(file) {
-  const original = await readFileAsDataURL(file);
-  const img = await loadImage(original);
-  let width = img.naturalWidth || img.width;
-  let height = img.naturalHeight || img.height;
-  const scale = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(width, height));
-  width = Math.max(1, Math.round(width * scale));
-  height = Math.max(1, Math.round(height * scale));
-
-  // GIFs may be animated; canvas would flatten them. Preserve reasonably-sized
-  // GIFs, otherwise make a static optimized preview so storage stays sane.
-  if (file.type === "image/gif" && scale === 1 && file.size < 2_000_000) {
-    return { src: original, width, height, alt: file.name || "Image" };
-  }
-
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, 0, 0, width, height);
-  let src;
-  try {
-    src = canvas.toDataURL("image/webp", IMAGE_QUALITY);
-    if (!src.startsWith("data:image/webp")) throw new Error("WebP unsupported");
-  } catch (e) {
-    src = canvas.toDataURL("image/jpeg", IMAGE_QUALITY);
-  }
-  return { src, width, height, alt: file.name || "Image" };
 }
 
 function insertImageDataUrl({ src, width, alt }) {
@@ -778,8 +653,7 @@ async function insertImageFiles(files) {
   setStatus("saving", "Processing image…");
   try {
     for (const file of imageFiles) {
-      const data = await fileToImageDataUrl(file);
-      insertImageDataUrl(data);
+      insertImageDataUrl(await prepareImage(file, { alt: file.name || "Image" }));
     }
     editor.focus();
     refreshToolbarState();
@@ -787,16 +661,6 @@ async function insertImageFiles(files) {
   } catch (e) {
     setStatus("bad", "Image failed");
   }
-}
-
-function imageFilesFromDataTransfer(dt) {
-  if (!dt) return [];
-  const files = Array.from(dt.files || []).filter(isImageFile);
-  if (files.length) return files;
-  return Array.from(dt.items || [])
-    .filter((item) => item.kind === "file" && IMAGE_TYPES.has(item.type))
-    .map((item) => item.getAsFile())
-    .filter(isImageFile);
 }
 
 function setCaretFromPoint(x, y) {
@@ -914,7 +778,7 @@ editor.addEventListener("dragend", () => {
 
 editor.addEventListener("dragover", (e) => {
   const types = Array.from((e.dataTransfer && e.dataTransfer.types) || []);
-  if (draggedImage || imageFilesFromDataTransfer(e.dataTransfer).length || types.includes("Files") || types.includes("text/html") || types.includes("text/plain")) {
+  if (draggedImage || imageFilesFrom(e.dataTransfer).length || types.includes("Files") || types.includes("text/html") || types.includes("text/plain")) {
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = draggedImage ? "move" : "copy";
     editor.classList.add("drop-target");
@@ -948,7 +812,7 @@ editor.addEventListener("drop", (e) => {
     return;
   }
 
-  const files = imageFilesFromDataTransfer(e.dataTransfer);
+  const files = imageFilesFrom(e.dataTransfer);
   if (files.length) {
     e.preventDefault();
     setCaretFromPoint(e.clientX, e.clientY);
@@ -990,12 +854,16 @@ function sanitizeImageElement(srcImg) {
   return img;
 }
 
+// What the link prompt looks like: the sandbox blocks window.prompt, so the ui
+// library's dialog asks instead.
+const LINK_PROMPT = { placeholder: "https://", okLabel: "Insert" };
+
 // The link button: edit the link under the cursor if there is one, else create.
 async function insertLink() {
   const existing = currentLink();
   if (existing) return editLink(existing);
   savedRange = getRange();
-  const url = await promptInline("Enter URL:");
+  const url = await promptInline("Enter URL:", "", LINK_PROMPT);
   if (!url) return;
   restoreRange();
   document.execCommand("createLink", false, normalizeHref(url));
@@ -1004,7 +872,7 @@ async function insertLink() {
 }
 
 async function editLink(anchor) {
-  const url = await promptInline("Edit URL:", anchor.getAttribute("href") || "");
+  const url = await promptInline("Edit URL:", anchor.getAttribute("href") || "", LINK_PROMPT);
   if (url === null) return;
   selectNode(anchor);
   if (url.trim() === "") {
@@ -1076,57 +944,6 @@ function updateLinkPopover() {
 
 window.addEventListener("scroll", () => { if (activeLink) positionLinkPopover(activeLink); }, true);
 window.addEventListener("resize", () => { if (activeLink) positionLinkPopover(activeLink); });
-
-// Inline prompt (alert/prompt are blocked in the sandbox iframe)
-function promptInline(message, def = "") {
-  return new Promise((resolve) => {
-    const overlay = el("div", {}, []);
-    Object.assign(overlay.style, {
-      position: "fixed", inset: "0", display: "flex", alignItems: "center",
-      justifyContent: "center", background: "rgba(20,20,25,0.35)",
-      backdropFilter: "blur(5px)", zIndex: "1000",
-    });
-    const input = el("input", { value: def, placeholder: "https://" });
-    Object.assign(input.style, {
-      width: "100%", padding: "8px 10px", fontSize: "13.5px",
-      border: "1px solid var(--line-strong)", borderRadius: "6px",
-      background: "var(--bg)", color: "var(--text)", outline: "none",
-    });
-    const ok = el("button", {}, "Insert");
-    const cancel = el("button", {}, "Cancel");
-    for (const b of [ok, cancel]) Object.assign(b.style, {
-      padding: "6px 12px", fontSize: "13px", borderRadius: "6px",
-      border: "1px solid var(--line)", background: "var(--surface)",
-      color: "var(--text)", cursor: "pointer",
-    });
-    Object.assign(ok.style, { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" });
-    const card = el("div", {}, [
-      el("div", { html: message }), input,
-      el("div", {}, [cancel, ok]),
-    ]);
-    Object.assign(card.style, {
-      background: "var(--surface)", border: "1px solid var(--line)", borderRadius: "10px",
-      padding: "16px", width: "min(420px, 90vw)", display: "flex", flexDirection: "column",
-      gap: "12px", boxShadow: "0 12px 40px rgba(0,0,0,0.25)",
-    });
-    card.lastChild.style.display = "flex";
-    card.lastChild.style.justifyContent = "flex-end";
-    card.lastChild.style.gap = "8px";
-    card.firstChild.style.fontSize = "13px";
-    card.firstChild.style.color = "var(--muted)";
-    overlay.appendChild(card);
-    document.body.appendChild(overlay);
-    input.focus();
-    const done = (val) => { overlay.remove(); resolve(val); };
-    ok.addEventListener("click", () => done(input.value));
-    cancel.addEventListener("click", () => done(null));
-    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) done(null); });
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") done(input.value);
-      if (e.key === "Escape") done(null);
-    });
-  });
-}
 
 // --- Paste sanitizer -------------------------------------------------------
 // Pasted content (especially from Google Docs / Word) carries formatting in
@@ -1279,7 +1096,7 @@ function escapeText(t) {
 editor.addEventListener("paste", (e) => {
   const cb = e.clipboardData;
   if (!cb) return;
-  const imageFiles = imageFilesFromDataTransfer(cb);
+  const imageFiles = imageFilesFrom(cb);
   if (imageFiles.length) {
     e.preventDefault();
     savedRange = getRange();
@@ -1354,24 +1171,20 @@ style.textContent += realtimeCss;
 const remoteCaretLayer = el("div", { class: "remote-caret-layer", "aria-hidden": "true" });
 document.body.appendChild(remoteCaretLayer);
 
-const collaboratorName = "Guest " + clientId.slice(0, 4).toUpperCase();
-const collaboratorColor = `hsl(${parseInt(clientId.slice(0, 6), 36) % 360} 62% 48%)`;
-let saveTimer = null;
-let saveInFlight = false;
-let saveAgain = false;
+const me = collaboratorFor(clientId);
 let applyingRemote = false;
 let revision = 0;
 let acknowledgedTitle = "Untitled document";
 const acknowledged = new Map(); // id -> {html, version}
 const pendingByBlock = new Map();
-const collaborators = new Map();
+const roster = new PresenceRoster(clientId);
 
-let curStatusKind = null, curStatusText = null;
+// The dot's classes are this stylesheet's. The sync library names a rejected
+// save `conflict` and a failed one `offline`; both are drawn the way this
+// editor has always drawn them.
+const STATUS_KINDS = { conflict: "synced", offline: "bad" };
 function setStatus(kind, text) {
-  if (kind === curStatusKind && text === curStatusText) return;
-  curStatusKind = kind; curStatusText = text;
-  statusDot.className = "dot " + kind;
-  statusText.textContent = text;
+  saveStatus.set(STATUS_KINDS[kind] ?? kind, text);
 }
 
 function newBlockId() {
@@ -1447,16 +1260,27 @@ function parseBlock(block) {
   return node;
 }
 
-function scheduleSave(delay = 220) {
+// Typing stays optimistic; the scheduler debounces, serializes and retries what
+// crosses RPC. Only the payload and what counts as dirty are this gadget's.
+const saver = new SaveScheduler({ save: sendChanges, isDirty, onStatus: setStatus });
+
+function scheduleSave(delay) {
   if (applyingRemote) return;
-  setStatus("saving", "Saving…");
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(doSave, delay);
+  saver.schedule(delay);
 }
 
-async function doSave() {
-  clearTimeout(saveTimer);
-  if (saveInFlight) { saveAgain = true; return; }
+function currentTitle() {
+  return titleInput.value.trim() || "Untitled document";
+}
+
+function isDirty() {
+  const blocks = serializeBlocks();
+  return blocks.some((block) => acknowledged.get(block.id)?.html !== block.html) ||
+    blocks.length !== acknowledged.size ||
+    currentTitle() !== acknowledgedTitle;
+}
+
+async function sendChanges() {
   const blocks = serializeBlocks();
   const currentIds = new Set(blocks.map((b) => b.id));
   const upserts = blocks
@@ -1465,54 +1289,32 @@ async function doSave() {
   const deletes = Array.from(acknowledged.entries())
     .filter(([id]) => !currentIds.has(id))
     .map(([id, block]) => ({ id, baseVersion: block.version }));
-  const title = titleInput.value.trim() || "Untitled document";
-  if (!upserts.length && !deletes.length && title === acknowledgedTitle) {
-    setStatus("saved", "Saved");
-    return;
-  }
+  const title = currentTitle();
+  if (!upserts.length && !deletes.length && title === acknowledgedTitle) return "saved";
 
-  saveInFlight = true;
-  try {
-    const result = await gadget.applyOperation({
-      senderId: clientId, baseRevision: revision, upserts, deletes,
-      order: blocks.map((b) => b.id), title,
-    });
-    revision = Math.max(revision, result.revision || 0);
-    for (const block of result.upserts || []) acknowledged.set(block.id, { html: block.html, version: block.version });
-    for (const id of result.deletedIds || []) acknowledged.delete(id);
-    acknowledgedTitle = result.title || title;
+  const result = await gadget.applyOperation({
+    senderId: clientId, baseRevision: revision, upserts, deletes,
+    order: blocks.map((b) => b.id), title,
+  });
+  revision = Math.max(revision, result.revision || 0);
+  for (const block of result.upserts || []) acknowledged.set(block.id, { html: block.html, version: block.version });
+  for (const id of result.deletedIds || []) acknowledged.delete(id);
+  acknowledgedTitle = result.title || title;
+  if (!result.conflicts?.length) return "saved";
 
-    if (result.conflicts?.length) {
-      // Keep the local draft visible, but rebase its next operation on the latest
-      // authoritative block version. The next save intentionally preserves mine.
-      for (const block of result.conflicts) acknowledged.set(block.id, { html: block.html, version: block.version });
-      setStatus("synced", "Resolving concurrent edit…");
-      saveAgain = true;
-    } else {
-      setStatus("saved", "Saved");
-    }
-  } catch (e) {
-    setStatus("bad", "Save failed");
-  } finally {
-    saveInFlight = false;
-    const latest = serializeBlocks();
-    const stillDirty = latest.some((b) => acknowledged.get(b.id)?.html !== b.html) ||
-      latest.length !== acknowledged.size ||
-      (titleInput.value.trim() || "Untitled document") !== acknowledgedTitle;
-    if (saveAgain || stillDirty) {
-      saveAgain = false;
-      scheduleSave(40);
-    }
-  }
+  // Keep the local draft visible, but rebase its next operation on the latest
+  // authoritative block version. The next save intentionally preserves mine.
+  for (const block of result.conflicts) acknowledged.set(block.id, { html: block.html, version: block.version });
+  return "conflict";
 }
 
 editor.addEventListener("input", () => {
   if (selectedImage && !editor.contains(selectedImage)) hideImageControls();
   else if (selectedImage) positionImageControls();
   scheduleSave();
-  schedulePresence();
+  presence.schedule();
 });
-titleInput.addEventListener("input", scheduleSave);
+titleInput.addEventListener("input", () => scheduleSave());
 
 try { document.execCommand("styleWithCSS", false, true); } catch (e) {}
 try { document.execCommand("defaultParagraphSeparator", false, "p"); } catch (e) {}
@@ -1556,7 +1358,7 @@ function applyRemoteOperation(event) {
   acknowledgedTitle = event.title || acknowledgedTitle;
   applyingRemote = false;
   setStatus("synced", activeId && pendingByBlock.has(activeId) ? "Concurrent edit pending" : "Live update");
-  setTimeout(() => { if (!saveInFlight && !saveTimer) setStatus("saved", "Saved"); }, 900);
+  setTimeout(() => { if (!saver.busy) setStatus("saved", "Saved"); }, 900);
 }
 
 function applySnapshot(doc) {
@@ -1603,12 +1405,13 @@ editor.addEventListener("focusout", () => {
   setTimeout(() => {
     if (!linkPop.contains(document.activeElement)) hideLinkPopover();
     if (id) settlePendingBlock(id);
-    sendPresence();
+    presence.sendNow();
   }, 0);
 });
 
 // --- Ephemeral presence ----------------------------------------------------
-let presenceTimer = null;
+// The roster and the throttled reporter are the sync library's; where a caret
+// sits in a block, and how it is drawn, are this editor's.
 function containingBlock(node) {
   if (!node || !editor.contains(node)) return null;
   if (node.nodeType !== 1) node = node.parentElement;
@@ -1625,22 +1428,21 @@ function textOffsetForPoint(block, node, offset) {
     return range.toString().length;
   } catch (e) { return 0; }
 }
-function schedulePresence() {
-  clearTimeout(presenceTimer);
-  presenceTimer = setTimeout(sendPresence, 70);
-}
-function sendPresence() {
+// Anchor and focus endpoints let everyone draw both a caret and a selection,
+// including one spanning several top-level blocks.
+function currentPresence() {
   const sel = window.getSelection();
   const anchorBlock = containingBlock(sel?.anchorNode);
   const focusBlock = containingBlock(sel?.focusNode);
-  gadget.updatePresence({
-    clientId, name: collaboratorName, color: collaboratorColor,
+  return {
+    clientId, name: me.name, color: me.color,
     anchorBlockId: blockId(anchorBlock),
     anchorOffset: textOffsetForPoint(anchorBlock, sel?.anchorNode, sel?.anchorOffset || 0),
     focusBlockId: blockId(focusBlock),
     focusOffset: textOffsetForPoint(focusBlock, sel?.focusNode, sel?.focusOffset || 0),
-  }).catch(() => {});
+  };
 }
+const presence = new PresenceReporter(currentPresence, (update) => gadget.updatePresence(update));
 function domPointAtTextOffset(block, requestedOffset) {
   const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
   let remaining = Math.max(0, requestedOffset || 0), text = null, last = null;
@@ -1662,15 +1464,15 @@ function caretRectAtPoint(block, point) {
   const r = block.getBoundingClientRect();
   return { left: r.left, top: r.top + 3, height: Math.min(22, Math.max(18, r.height - 6)) };
 }
-function orderedSelectionRange(person) {
-  const anchorBlock = person.anchorBlockId && findBlock(person.anchorBlockId);
-  const focusBlock = person.focusBlockId && findBlock(person.focusBlockId);
+function orderedSelectionRange(cursor) {
+  const anchorBlock = cursor.anchorBlockId && findBlock(cursor.anchorBlockId);
+  const focusBlock = cursor.focusBlockId && findBlock(cursor.focusBlockId);
   if (!anchorBlock || !focusBlock) return null;
-  const anchor = domPointAtTextOffset(anchorBlock, person.anchorOffset);
-  const focus = domPointAtTextOffset(focusBlock, person.focusOffset);
+  const anchor = domPointAtTextOffset(anchorBlock, cursor.anchorOffset);
+  const focus = domPointAtTextOffset(focusBlock, cursor.focusOffset);
   const blockOrder = Array.from(editor.children);
   const ai = blockOrder.indexOf(anchorBlock), fi = blockOrder.indexOf(focusBlock);
-  const anchorFirst = ai < fi || (ai === fi && person.anchorOffset <= person.focusOffset);
+  const anchorFirst = ai < fi || (ai === fi && cursor.anchorOffset <= cursor.focusOffset);
   const start = anchorFirst ? anchor : focus;
   const end = anchorFirst ? focus : anchor;
   const range = document.createRange();
@@ -1680,8 +1482,8 @@ function orderedSelectionRange(person) {
 }
 function renderPresence() {
   remoteCaretLayer.replaceChildren();
-  for (const person of collaborators.values()) {
-    const selection = orderedSelectionRange(person);
+  for (const person of roster.entries()) {
+    const selection = person.cursor && orderedSelectionRange(person.cursor);
     if (!selection) continue;
 
     if (!selection.range.collapsed) {
@@ -1705,47 +1507,32 @@ function renderPresence() {
   }
 }
 function applyPresence(event) {
-  if (!event?.clientId || event.clientId === clientId) return;
-  if (event.type === "leave") collaborators.delete(event.clientId);
-  else collaborators.set(event.clientId, { ...event, seenAt: Date.now() });
-  renderPresence();
+  if (roster.apply(event)) renderPresence();
 }
 document.addEventListener("selectionchange", () => {
-  if (editor.contains(window.getSelection()?.anchorNode)) schedulePresence();
+  if (editor.contains(window.getSelection()?.anchorNode)) presence.schedule();
 });
-window.addEventListener("scroll", () => { if (collaborators.size) renderPresence(); }, true);
-window.addEventListener("resize", () => { if (collaborators.size) renderPresence(); });
+window.addEventListener("scroll", () => { if (roster.entries().length) renderPresence(); }, true);
+window.addEventListener("resize", () => { if (roster.entries().length) renderPresence(); });
 
 // onRpcBroken and unload delivery can both be delayed by the browser. A small
 // heartbeat makes stationary cursors live, while stale collaborators disappear
 // predictably even when a tab/process is killed without a clean disconnect.
-const PRESENCE_HEARTBEAT_MS = 4000;
-const PRESENCE_STALE_MS = 12000;
-setInterval(() => {
-  sendPresence();
-  const cutoff = Date.now() - PRESENCE_STALE_MS;
-  let changed = false;
-  for (const [id, person] of collaborators) {
-    if ((person.seenAt || 0) < cutoff) {
-      collaborators.delete(id);
-      changed = true;
-    }
-  }
-  if (changed) renderPresence();
-}, PRESENCE_HEARTBEAT_MS);
+presence.startHeartbeat(() => { if (roster.expire()) renderPresence(); });
 
 window.addEventListener("pagehide", () => {
   // This is best-effort only; stale expiry above is the guaranteed fallback.
   gadget.leavePresence(clientId).catch(() => {});
 });
 
-class DocCallbacks extends RpcTarget {
+// The server's callbacks, on the RpcTarget the bootstrap provides.
+const subscriber = createSubscriber(RpcTarget, {
   operation(event) {
     if (event.type === "snapshot") applySnapshot(event.document);
     else applyRemoteOperation(event);
-  }
-  presence(event) { applyPresence(event); }
-}
+  },
+  presence(event) { applyPresence(event); },
+});
 
 if (isDocumentExport) {
   document.documentElement.classList.add("document-export");
@@ -1757,9 +1544,7 @@ if (isDocumentExport) {
 // --- Init ------------------------------------------------------------------
 
   try {
-    let doc = await gadget.subscribe(new DocCallbacks(), {
-      clientId, name: collaboratorName, color: collaboratorColor,
-    });
+    let doc = await gadget.subscribe(subscriber, { clientId, name: me.name, color: me.color });
     if (!doc.blocks) {
       // One-time, backwards-compatible conversion of the former HTML snapshot.
       editor.innerHTML = doc.legacyContent || "";
@@ -1770,7 +1555,7 @@ if (isDocumentExport) {
     }
     applySnapshot(doc);
     setStatus("saved", "Saved");
-    sendPresence();
+    presence.sendNow();
   } catch (e) {
     console.error(e);
     setStatus("bad", "Offline");

@@ -156,6 +156,22 @@ Formatting keys accepted by the server are `b` (bold), `i` (italic), `u` (underl
 
 ## Architecture
 
+The browser side is built on the shared gadget libraries the deployment ships. `gadget.json` pins
+them:
+
+```json
+{"libraries": {"sync": "latest", "ui": "latest"}}
+```
+
+`gadgets:ui/client` draws the chrome: the element builder, the shared toolbar icons and controls
+(icon and segment buttons, groups, colour pickers, the dropdown behind the number-format menu), the
+in-page prompt that stands in for the `window.prompt` the sandbox blocks, and the save-status dot.
+`gadgets:sync/client` is the browser's half of the collaboration loop: the debounced, serialized,
+retrying save scheduler, the presence roster and heartbeat, and the subscriber object the server
+calls back on. The Durable Object keeps its own mutation queue and subscriber map (see below: its
+broadcasts run outside the queue so a callback may re-enter it). The cell model, the formula engine,
+the grid, the sheet tabs and the exports are this gadget's own.
+
 ### `client.js`
 
 Builds the entire browser interface in JavaScript. It contains:
@@ -164,7 +180,7 @@ Builds the entire browser interface in JavaScript. It contains:
 - Cell editing, formatting, sorting, and structural operations
 - Formula tokenization, parsing, evaluation, and display formatting
 - Clipboard and keyboard support
-- A local model with debounced saves
+- A local model whose saves are queued per cell and flushed by the library's scheduler
 - RPC callbacks for live server operations and presence events
 
 Formula evaluation happens in the browser. The engine caches computed cells, detects circular references, supports ranges and cross-sheet references, and displays standard errors including `#DIV/0!`, `#VALUE!`, `#REF!`, `#NAME?`, `#N/A`, `#NUM!`, and `#CYCLE!`.
@@ -198,7 +214,11 @@ Default sheets have 100 rows and 26 columns. Server validation permits up to 50,
 
 ## Collaboration notes
 
-The server and client synchronization code support multiple connected clients and live updates. Remote collaborator badges and selection overlays are currently disabled in the UI, so the app presents as a single-user spreadsheet even though remote operations still synchronize.
+The server and client synchronization code support multiple connected clients and live updates. Each
+tab introduces itself with the guest name and colour the sync library derives from its client ID, and
+reports its selected range on the library's throttle and heartbeat. Remote collaborator badges and
+selection overlays are currently disabled in the UI, so the app presents as a single-user spreadsheet
+even though remote operations still synchronize.
 
 ## Current limitations
 

@@ -61,6 +61,10 @@ import {
   validateChatAttachmentUpload,
 } from "./chat-attachment-validation";
 import { renderGadgetInBrowser } from "./browser-export";
+import { LIBRARY_SIDES, libraryImportsIn, parseLibrarySpecifier, readPins } from "./gadget-libraries";
+import {
+  LIBRARIES_FINGERPRINT, type ResolvedLibrary, gadgetWorkerModules, resolveLibraries,
+} from "./gadget-library-resolution";
 import {
   defaultExportFormats,
   exportServerFormat,
@@ -4884,7 +4888,10 @@ class OverseerImpl implements AgentHooks {
       codeVersion += `.${chatId}.${sequence}`;
     }
 
-    return this.env.LOADER.get(`${this.ctx.id}.${codeVersion}.${gadgetId}`, async () => {
+    // The libraries fingerprint is in the key so a cached load never outlives the bundles it was
+    // built from: a `latest` pin means whatever this deployment ships.
+    let loaderKey = `${this.ctx.id}.${codeVersion}.${gadgetId}.${LIBRARIES_FINGERPRINT}`;
+    return this.env.LOADER.get(loaderKey, async () => {
       // The snapshot meta above serves the as-of-`sequence` doc build; this re-read only keeps
       // the old fail-on-deleted-chat behavior (don't cache a load for a chat deleted mid-load).
       if (chatId !== undefined) this.getChatMetaOrThrow(chatId);
@@ -4905,11 +4912,12 @@ class OverseerImpl implements AgentHooks {
             : new Map();
       }
 
-      let modules: Record<string, string> = {};
-      for (let [file, content] of files) {
-        if (file.endsWith(".js")) {
-          modules[file] = content;
-        }
+      let {modules, libraries} = gadgetWorkerModules(files);
+      if (libraries.length > 0) {
+        this.logger.debug("resolved gadget libraries", {
+          event: "gadget.libraries.resolved", workpieceId: gadgetId, chatId,
+          libraries: libraries.map(({specifier, hash}) => `${specifier}@${hash.slice(0, 16)}`),
+        });
       }
 
       let tailProps: GadgetTailLoopbackProps = {
@@ -5094,10 +5102,38 @@ class OverseerImpl implements AgentHooks {
   }
 
   async getGadgetUiBundle(gadgetId: WorkpieceId, chatId?: number): Promise<UiBundle | null> {
-    // TODO: Bundle the UI? For now we just return client.js.
+    let bundle = await this.#clientBundle(gadgetId, chatId);
+    if (!bundle) return null;
+    let {jsCode, libraries} = bundle;
+    return libraries.length > 0
+        ? {jsCode, libraries: libraries.map(({specifier, hash}) => ({specifier, hash}))}
+        : {jsCode};
+  }
+
+  /**
+   * The code behind one `UiBundle.libraries` entry, resolved through the gadget's pins at the same
+   * code version (see GadgetClient.getLibraryCode). Only the client side is ever handed out.
+   */
+  async getGadgetLibraryCode(gadgetId: WorkpieceId, specifier: string, chatId?: number)
+      : Promise<string> {
+    let parsed = parseLibrarySpecifier(specifier);
+    if (parsed?.side !== "client") throw new Error(`Not a client library: ${specifier}`);
+    let bundle = await this.#clientBundle(gadgetId, chatId);
+    let library = bundle?.libraries.find(candidate => candidate.specifier === specifier);
+    if (!library) throw new Error(`This gadget does not import ${specifier}.`);
+    return library.code;
+  }
+
+  // The gadget's client.js plus the client libraries its gadget.json pins, from one read of its
+  // files (see readGadgetFiles): the UI bundle ships the libraries as refs, the browser export as
+  // code, and getGadgetLibraryCode serves a ref's code from the same resolution.
+  async #clientBundle(gadgetId: WorkpieceId, chatId?: number)
+      : Promise<{jsCode: string, libraries: ResolvedLibrary[]} | null> {
     this.checkChatExistsAndMaterializeChanges(chatId);
-    let jsCode = (await this.readGadgetFiles(gadgetId, chatId)).get("client.js");
-    return jsCode !== undefined ? {jsCode} : null;
+    let files = await this.readGadgetFiles(gadgetId, chatId);
+    let jsCode = files.get("client.js");
+    if (jsCode === undefined) return null;
+    return {jsCode, libraries: resolveLibraries(readPins(files), "client")};
   }
 
   async getGadgetExportFormats(gadgetId: WorkpieceId, chatId?: number)
@@ -5124,10 +5160,10 @@ class OverseerImpl implements AgentHooks {
     } else {
       let browser = this.env.BROWSER;
       if (!browser) throw new Error("Gadget export is not configured for this deployment.");
-      let bundle = await this.getGadgetUiBundle(gadgetId, chatId);
+      let bundle = await this.#clientBundle(gadgetId, chatId);
       if (!bundle) throw new Error("This Gadget does not have a UI to export.");
       let title = this.getGadgetRecord(gadgetId).title;
-      return renderGadgetInBrowser(browser, bundle.jsCode, title, exportGadget.dup(), format);
+      return renderGadgetInBrowser(browser, bundle, title, exportGadget.dup(), format);
     }
   }
 
@@ -6796,14 +6832,41 @@ class OverseerImpl implements AgentHooks {
           `\n` +
           `This binding is an RPC stub that points at the main Durable Object instance of the ` +
           `Gadget ${JSON.stringify(gadget.title)}. Calling a method on the stub invokes the ` +
-          `same-named method on the class exported by the Gadget's server.js (read that file to ` +
-          `learn the API it offers).`;
+          `same-named method on the class exported by the Gadget's server.js` +
+          (await this.#describeGadgetLibraryImports(gadget.id) ??
+              ` (read that file to learn the API it offers).`);
     }
     let gatekeeper = this.storage.gatekeepers.get(id);
     if (!gatekeeper) {
       throw new Error(`The resource behind ${envName} no longer exists.`);
     }
     return this.describeGatekeeper(envName, gatekeeper);
+  }
+
+  /**
+   * How describeBinding ends for a gadget whose committed server.js gets its class from a library,
+   * or undefined for one that does not: such a server.js may be one re-export line, so reading it
+   * teaches the agent nothing, and the interface is in the library's declarations, which
+   * `describeGadgetLibrary` shows. Read from the pins and the import text alone -- never from the
+   * library shipped today -- so the text changes only when the gadget's own code does, like the
+   * file it would otherwise point the agent at.
+   */
+  async #describeGadgetLibraryImports(gadgetId: WorkpieceId): Promise<string | undefined> {
+    let head = this.getGadgetHead(gadgetId);
+    if (head === undefined) return undefined;
+    let files = await this.gitStore.readCommitFiles(head);
+    let pins = readPins(files);
+    let serverJs = files.get("server.js") ?? "";
+    let imported = libraryImportsIn(serverJs, "server").filter(name => pins.has(name));
+    if (imported.length === 0) return undefined;
+    let reexported = imported.filter(name => new RegExp(
+        `export\\s*\\{[^}]*\\bGadget\\b[^}]*\\}\\s*from\\s*["']gadgets:${name}/server["']`, "u").test(serverJs));
+    return (reexported.length > 0
+        ? `, which re-exports its Gadget class from ${serverSpecifiers(reexported)}, so the stub's ` +
+          `methods are that class's: call ${describeLibraryCalls(reexported)} for the methods and types`
+        : `, which imports ${serverSpecifiers(imported)} (read server.js for the methods it offers, and ` +
+          `call ${describeLibraryCalls(imported)} for what the library provides)`) +
+        ` rather than reading the library's bundle.`;
   }
 
   async describeGatekeeper(name: string, gatekeeper: GatekeeperRecord): Promise<string> {
@@ -10070,6 +10133,10 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     if (files.size === 0) {
       throw new Error("This blueprint's code archive is empty.");
     }
+    // A pin the deployment cannot honour fails the instantiation rather than yielding a workspace
+    // whose gadget cannot load.
+    let pins = readPins(files);
+    for (let side of LIBRARY_SIDES) resolveLibraries(pins, side);
     let ownerId = this.impl.ownerId;
     if (!ownerId) {
       throw new Error("Workspace has no owner.");
@@ -12129,6 +12196,16 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 }
 
+// The server-side specifiers of `names`, spelled for describeBinding's text.
+function serverSpecifiers(names: string[]): string {
+  return names.map(name => `\`gadgets:${name}/server\``).join(" and ");
+}
+
+// The describeGadgetLibrary calls that document `names`, spelled for describeBinding's text.
+function describeLibraryCalls(names: string[]): string {
+  return names.map(name => `describeGadgetLibrary(${JSON.stringify(name)})`).join(" and ");
+}
+
 // Restricted capability handed to "use"-role collaborators. It implements the full `Overseer`
 // interface but permits only the handful of methods needed to render and interact with the
 // gadgets' deployed UIs: getMetadata() (restricted to id/title/owner), a restricted
@@ -12466,6 +12543,10 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     return this.impl.getGadgetUiBundle(this.id, chatId);
   }
 
+  async getLibraryCode(specifier: string, chatId?: number): Promise<string> {
+    return this.impl.getGadgetLibraryCode(this.id, specifier, chatId);
+  }
+
   async connectToGadget(chatId?: number): Promise<RpcStub<any>> {
     this.impl.recordGadgetAnalytics({
       event_name: "gadget_interaction",
@@ -12732,6 +12813,13 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
       this.#deny();
     }
     return this.impl.getGadgetUiBundle(this.id);
+  }
+
+  async getLibraryCode(specifier: string, chatId?: number): Promise<string> {
+    if (chatId !== undefined) {
+      this.#deny();
+    }
+    return this.impl.getGadgetLibraryCode(this.id, specifier);
   }
 
   async connectToGadget(chatId?: number): Promise<RpcStub<any>> {

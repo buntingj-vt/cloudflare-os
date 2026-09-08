@@ -1,15 +1,41 @@
 // ---------------------------------------------------------------------------
-// Sheets — a Google-Sheets-style spreadsheet. Same suite chrome as Docs.
-// Builds the entire UI in JS. See README.md for architecture.
+// Sheets — a spreadsheet with a formula engine, built over the shared gadget
+// libraries: `gadgets:ui/client` draws the chrome and `gadgets:sync/client` keeps
+// this browser in step with the Durable Object. The cell model, the formula engine
+// and the grid are this gadget's own. See README.md for architecture.
 // ---------------------------------------------------------------------------
+import {
+  ICONS as UI_ICONS,
+  PROMPT_STYLES,
+  colorBtn,
+  customSelect,
+  el,
+  group,
+  icon,
+  iconBtn,
+  promptInline,
+  segBtn,
+  statusIndicator,
+} from "gadgets:ui/client";
+import {
+  PresenceReporter,
+  PresenceRoster,
+  SaveScheduler,
+  collaboratorFor,
+  createSubscriber,
+} from "gadgets:sync/client";
 
 const clientId = Math.random().toString(36).slice(2);
+// This tab's guest identity, as the server repeats it to everyone else.
+const me = collaboratorFor(clientId);
 
 // ===========================================================================
 // Styles — shares the Docs design tokens, adds grid-specific styling.
 // ===========================================================================
 const style = document.createElement("style");
-style.textContent = `
+// The library's prompt dialog brings its own rules; everything after them is this
+// gadget's, so a rule here wins where the two meet.
+style.textContent = PROMPT_STYLES + `
 :root {
   color-scheme: light;
   --bg:        #f6f6f4;
@@ -60,6 +86,8 @@ html, body {
 .dot.saved { background: var(--ok); }
 .dot.bad { background: var(--bad); }
 .dot.synced { background: var(--accent); animation: pulse .6s 2 var(--ease-in-out); }
+.dot.conflict { background: var(--accent); animation: pulse 1s infinite var(--ease-in-out); }
+.dot.offline { background: var(--bad); }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
 .spacer { flex: 1 1 auto; }
 .peers { display: flex; align-items: center; gap: -6px; flex: 0 0 auto; }
@@ -213,19 +241,9 @@ table.grid th, table.grid td { padding: 0; margin: 0; }
 .ctx-item .k { color: var(--faint); font-size: 11px; }
 .ctx-sep { height: 1px; background: var(--line); margin: 4px 6px; }
 
-/* Inline dialog (alert/prompt blocked in sandbox) */
-.overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
-  background: rgba(20,20,25,0.35); backdrop-filter: blur(5px); z-index: 2000; }
-.dialog { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px;
-  width: min(420px, 90vw); display: flex; flex-direction: column; gap: 12px; box-shadow: 0 12px 40px rgba(0,0,0,0.25); }
-.dialog .msg { font-size: 13px; color: var(--muted); }
-.dialog input { width: 100%; padding: 8px 10px; font-size: 13.5px; border: 1px solid var(--line-strong);
-  border-radius: 6px; background: var(--bg); color: var(--text); outline: none; }
-.dialog .row { display: flex; justify-content: flex-end; gap: 8px; }
-.dialog button { padding: 6px 12px; font-size: 13px; border-radius: 6px; border: 1px solid var(--line);
-  background: var(--surface); color: var(--text); cursor: pointer; }
-.dialog button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-.dialog button.danger { background: var(--bad); color: #fff; border-color: var(--bad); }
+/* Inline dialog (alert/prompt blocked in sandbox): drawn by PROMPT_STYLES, stacked
+   above the context menus. */
+.prompt-overlay { z-index: 2000; }
 
 @media (max-width: 720px) { .title-input { width: 40vw; } .topbar, .toolbar { padding: 8px 12px; } }
 
@@ -233,7 +251,7 @@ table.grid th, table.grid td { padding: 0; margin: 0; }
 @page { size: landscape; margin: 0.4in; }
 @media print {
   html, body { height: auto; overflow: visible; background: #fff; }
-  .app, .ctx, .overlay, .cmenu { display: none !important; }
+  .app, .ctx, .prompt-overlay, .cmenu { display: none !important; }
   #printWorkbook { display: block; color: var(--text); }
   .print-sheet { break-after: page; }
   .print-sheet:last-child { break-after: auto; }
@@ -269,34 +287,12 @@ table.grid th, table.grid td { padding: 0; margin: 0; }
 document.head.appendChild(style);
 
 // ===========================================================================
-// Small DOM + reference helpers
+// Icons and A1 reference helpers
 // ===========================================================================
-function el(tag, props = {}, children = []) {
-  const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(props)) {
-    if (k === "class") node.className = v;
-    else if (k === "html") node.innerHTML = v;
-    else if (k.startsWith("on")) node.addEventListener(k.slice(2).toLowerCase(), v);
-    else if (v !== null && v !== undefined) node.setAttribute(k, v);
-  }
-  for (const c of [].concat(children)) if (c) node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-  return node;
-}
-function icon(paths) {
-  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
-}
+// The library's shared toolbar icons plus the ones only a spreadsheet draws.
 const ICONS = {
-  undo: '<path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H9"/>',
-  redo: '<path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H15"/>',
-  bold: '<path d="M6 4h7a4 4 0 0 1 0 8H6z"/><path d="M6 12h8a4 4 0 0 1 0 8H6z"/>',
-  italic: '<line x1="19" y1="4" x2="10" y2="4"/><line x1="14" y1="20" x2="5" y2="20"/><line x1="15" y1="4" x2="9" y2="20"/>',
-  underline: '<path d="M6 3v7a6 6 0 0 0 12 0V3"/><line x1="4" y1="21" x2="20" y2="21"/>',
-  strike: '<path d="M16 4H9a3 3 0 0 0-2.83 4"/><path d="M14 12a4 4 0 0 1 0 8H6"/><line x1="4" y1="12" x2="20" y2="12"/>',
-  textcolor: '<path d="M4 20h16"/><path d="M7 16l5-12 5 12"/><path d="M9 11h6"/>',
+  ...UI_ICONS,
   fill: '<path d="M4 20h16"/><path d="M11 4l7 7-7 7-7-7z"/><path d="M11 4l0 0"/>',
-  alignLeft: '<line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="14" y2="12"/><line x1="4" y1="18" x2="18" y2="18"/>',
-  alignCenter: '<line x1="4" y1="6" x2="20" y2="6"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="5" y1="18" x2="19" y2="18"/>',
-  alignRight: '<line x1="4" y1="6" x2="20" y2="6"/><line x1="10" y1="12" x2="20" y2="12"/><line x1="6" y1="18" x2="20" y2="18"/>',
   currency: '<line x1="12" y1="2" x2="12" y2="22"/><path d="M17 6H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>',
   percent: '<line x1="19" y1="5" x2="5" y2="19"/><circle cx="7" cy="7" r="2.2"/><circle cx="17" cy="17" r="2.2"/>',
   decDec: '<path d="M4 8l4 4-4 4"/><text x="11" y="16" font-size="11" fill="currentColor" stroke="none">.0</text>',
@@ -310,7 +306,6 @@ const ICONS = {
   insCol: '<rect x="4" y="3" width="6" height="18" rx="1"/><line x1="17" y1="9" x2="17" y2="15"/><line x1="14" y1="12" x2="20" y2="12"/>',
   trash: '<path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6 7l1 13h10l1-13"/>',
   plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
-  clear: '<path d="M4 7V5h12v2"/><path d="M9 5l-2 14"/><line x1="14" y1="13" x2="20" y2="19"/><line x1="20" y1="13" x2="14" y2="19"/>',
 };
 
 // A1 <-> (row, col) — both zero-based internally.
@@ -1107,9 +1102,8 @@ function selRange() {
 }
 let focus = { r: 0, c: 0 };
 
-const collaboratorName = "Guest " + clientId.slice(0, 4).toUpperCase();
-const collaboratorColor = `hsl(${parseInt(clientId.slice(0, 6), 36) % 360} 62% 48%)`;
-const collaborators = new Map();
+// Everyone else here, and where they are; the events come from the server.
+const roster = new PresenceRoster(clientId);
 
 // ===========================================================================
 // Sheet accessors
@@ -1125,67 +1119,12 @@ function rowHeight(r) { return curSheet().rowHeights[r] || DEFAULT_ROW_H; }
 // Build chrome: topbar, toolbar, formula bar, grid container, tabs
 // ===========================================================================
 const titleInput = el("input", { class: "title-input", value: "Untitled spreadsheet", "aria-label": "Spreadsheet title" });
-const statusDot = el("span", { class: "dot saved" });
-const statusText = el("span", {}, "Saved");
-const peersEl = el("div", { class: "peers" });
+const saveStatus = statusIndicator({ title: "Save status" });
 const topbar = el("div", { class: "topbar" }, [
   el("div", { class: "title-wrap" }, [titleInput]),
   el("div", { class: "spacer" }),
-  el("div", { class: "status", title: "Save status" }, [statusDot, statusText]),
+  saveStatus.element,
 ]);
-
-// --- Toolbar builders (reuse Docs patterns) ---
-function iconBtn(name, title, onClick, label) {
-  const b = el("button", { class: "icon-btn", title });
-  if (label) b.textContent = label; else b.innerHTML = icon(ICONS[name]);
-  b.addEventListener("mousedown", (e) => e.preventDefault());
-  b.addEventListener("click", onClick);
-  return b;
-}
-function group(prio, items, first = false) {
-  const children = first ? [] : [el("div", { class: "tdiv" })];
-  children.push(...items);
-  return el("div", { class: "tgroup" + (prio ? " " + prio : "") }, children);
-}
-const chevSvg = icon('<polyline points="6 9 12 15 18 9"/>');
-function customSelect({ className, title, options, value, onChange, width }) {
-  let current;
-  const labelSpan = el("span", { class: "cs-label" });
-  const btn = el("button", { type: "button", class: "cselect " + (className || ""), title }, [labelSpan, el("span", { class: "cs-chev", html: chevSvg })]);
-  const menu = el("div", { class: "cmenu" });
-  const items = options.map((o) => {
-    if (o.sep) { const sp = el("div", { class: "cmenu-sep" }); menu.appendChild(sp); return null; }
-    const item = el("div", { class: "cmenu-item", "data-value": String(o.value) }, [
-      el("span", {}, o.label), o.ex ? el("span", { class: "ex" }, o.ex) : null,
-    ]);
-    item.addEventListener("mousedown", (e) => e.preventDefault());
-    item.addEventListener("click", () => { closeMenu(); setValue(o.value); onChange(o.value); });
-    menu.appendChild(item);
-    return item;
-  }).filter(Boolean);
-  let open = false;
-  function setValue(v) {
-    current = v;
-    const opt = options.find((o) => o.value === v);
-    labelSpan.textContent = opt ? opt.label : (options.find(o=>!o.sep)?.label || "");
-    items.forEach((it) => it.classList.toggle("sel", it.dataset.value === String(v)));
-  }
-  function openMenu() {
-    const r = btn.getBoundingClientRect();
-    menu.style.left = Math.round(r.left) + "px";
-    menu.style.top = Math.round(r.bottom + 4) + "px";
-    menu.style.minWidth = Math.round(r.width) + "px";
-    document.body.appendChild(menu);
-    open = true; btn.classList.add("open");
-  }
-  function closeMenu() { if (menu.parentNode) menu.parentNode.removeChild(menu); open = false; btn.classList.remove("open"); }
-  btn.addEventListener("click", () => { open ? closeMenu() : openMenu(); });
-  document.addEventListener("mousedown", (e) => { if (open && !menu.contains(e.target) && !btn.contains(e.target)) closeMenu(); });
-  window.addEventListener("scroll", () => { if (open) closeMenu(); }, true);
-  window.addEventListener("resize", () => { if (open) closeMenu(); });
-  setValue(value);
-  return { el: btn, setValue, getValue: () => current };
-}
 
 // Number format dropdown
 const NUMBER_FORMATS = [
@@ -1208,53 +1147,45 @@ const fmtSel = customSelect({
   onChange: (v) => setFmtOnSelection((f) => { if (v === "auto") delete f.nf; else f.nf = v; }),
 });
 
-const undoBtn = iconBtn("undo", "Undo (Ctrl+Z)", () => undo());
-const redoBtn = iconBtn("redo", "Redo (Ctrl+Y)", () => redo());
-const sumBtn = iconBtn("sigma", "Sum (auto)", () => autoSum());
+const undoBtn = iconBtn(ICONS.undo, "Undo (Ctrl+Z)", () => undo());
+const redoBtn = iconBtn(ICONS.redo, "Redo (Ctrl+Y)", () => redo());
+const sumBtn = iconBtn(ICONS.sigma, "Sum (auto)", () => autoSum());
 const fxBtn = iconBtn(null, "Insert function", (e) => openFunctionMenu(e), "ƒx");
 
-const currencyBtn = iconBtn("currency", "Format as currency", () => setFmtOnSelection((f) => { f.nf = "currency"; }));
-const percentBtn = iconBtn("percent", "Format as percent", () => setFmtOnSelection((f) => { f.nf = "percent"; }));
+const currencyBtn = iconBtn(ICONS.currency, "Format as currency", () => setFmtOnSelection((f) => { f.nf = "currency"; }));
+const percentBtn = iconBtn(ICONS.percent, "Format as percent", () => setFmtOnSelection((f) => { f.nf = "percent"; }));
 const decDecBtn = iconBtn(null, "Decrease decimals", () => changeDecimals(-1), "-.0");
 const incDecBtn = iconBtn(null, "Increase decimals", () => changeDecimals(1), ".00");
 
-const boldBtn = iconBtn("bold", "Bold (Ctrl+B)", () => toggleFmt("b"));
-const italicBtn = iconBtn("italic", "Italic (Ctrl+I)", () => toggleFmt("i"));
-const underlineBtn = iconBtn("underline", "Underline (Ctrl+U)", () => toggleFmt("u"));
-const strikeBtn = iconBtn("strike", "Strikethrough", () => toggleFmt("s"));
+const boldBtn = iconBtn(ICONS.bold, "Bold (Ctrl+B)", () => toggleFmt("b"));
+const italicBtn = iconBtn(ICONS.italic, "Italic (Ctrl+I)", () => toggleFmt("i"));
+const underlineBtn = iconBtn(ICONS.underline, "Underline (Ctrl+U)", () => toggleFmt("u"));
+const strikeBtn = iconBtn(ICONS.strike, "Strikethrough", () => toggleFmt("s"));
 
-function colorBtn(name, title, key, defaultColor) {
-  const bar = el("span", { class: "bar" });
-  bar.style.background = defaultColor;
-  const input = el("input", { type: "color", value: defaultColor });
-  const btn = el("div", { class: "color-btn", title }, [el("span", { html: icon(ICONS[name]) }), bar, input]);
-  btn.addEventListener("mousedown", (e) => e.preventDefault());
-  input.addEventListener("input", () => { bar.style.background = input.value; setFmtOnSelection((f) => { f[key] = input.value; }); });
-  return btn;
+// A colour or an alignment is one formatting key over the selection; left align is
+// the absence of the key.
+function setColorOnSelection(key, color) { setFmtOnSelection((f) => { f[key] = color; }); }
+function setAlignOnSelection(align) {
+  setFmtOnSelection((f) => { if (align === "l") delete f.a; else f.a = align; });
 }
-const textColorBtn = colorBtn("textcolor", "Text color", "c", "#1d1d20");
-const fillColorBtn = colorBtn("fill", "Fill color", "bg", "#fff3a3");
+const textColorBtn = colorBtn(ICONS.textcolor, "Text color", "#1d1d20", (color) => setColorOnSelection("c", color));
+const fillColorBtn = colorBtn(ICONS.fill, "Fill color", "#fff3a3", (color) => setColorOnSelection("bg", color));
 
-const alignBtns = {};
-function segBtn(name, title, val) {
-  const b = el("button", { class: "seg-btn", title, html: icon(ICONS[name]) });
-  b.addEventListener("mousedown", (e) => e.preventDefault());
-  b.addEventListener("click", () => setFmtOnSelection((f) => { if (val === "l") delete f.a; else f.a = val; }));
-  return b;
-}
-alignBtns.l = segBtn("alignLeft", "Align left", "l");
-alignBtns.c = segBtn("alignCenter", "Align center", "c");
-alignBtns.r = segBtn("alignRight", "Align right", "r");
+const alignBtns = {
+  l: segBtn(ICONS.alignLeft, "Align left", () => setAlignOnSelection("l")),
+  c: segBtn(ICONS.alignCenter, "Align center", () => setAlignOnSelection("c")),
+  r: segBtn(ICONS.alignRight, "Align right", () => setAlignOnSelection("r")),
+};
 const alignSegment = el("div", { class: "segment" }, [alignBtns.l, alignBtns.c, alignBtns.r]);
 
-const wrapBtn = iconBtn("wrap", "Wrap text", () => toggleFmt("wrap"));
+const wrapBtn = iconBtn(ICONS.wrap, "Wrap text", () => toggleFmt("wrap"));
 
-const insRowBtn = iconBtn("insRow", "Insert row above", () => insertRows(selRange().r1, 1));
-const insColBtn = iconBtn("insCol", "Insert column left", () => insertCols(selRange().c1, 1));
-const delRowBtn = iconBtn("trash", "Delete row(s)", () => deleteRows());
-const sortAscBtn = iconBtn("sortAsc", "Sort range A→Z", () => sortSelection(true));
-const sortDescBtn = iconBtn("sortDesc", "Sort range Z→A", () => sortSelection(false));
-const clearBtn = iconBtn("clear", "Clear formatting", () => clearFormatting());
+const insRowBtn = iconBtn(ICONS.insRow, "Insert row above", () => insertRows(selRange().r1, 1));
+const insColBtn = iconBtn(ICONS.insCol, "Insert column left", () => insertCols(selRange().c1, 1));
+const delRowBtn = iconBtn(ICONS.trash, "Delete row(s)", () => deleteRows());
+const sortAscBtn = iconBtn(ICONS.sortAsc, "Sort range A→Z", () => sortSelection(true));
+const sortDescBtn = iconBtn(ICONS.sortDesc, "Sort range Z→A", () => sortSelection(false));
+const clearBtn = iconBtn(ICONS.clear, "Clear formatting", () => clearFormatting());
 
 const toolbar = el("div", { class: "toolbar" }, [
   group(null, [undoBtn, redoBtn], true),
@@ -1291,23 +1222,13 @@ document.body.appendChild(app);
 document.body.appendChild(printWorkbook);
 
 // ===========================================================================
-// Save / operations queue (mirrors Docs optimistic model)
+// Save / operations queue — the library's scheduler over this gadget's payload
 // ===========================================================================
-let curStatusKind = null, curStatusText = null;
-function setStatus(kind, text) {
-  if (kind === curStatusKind && text === curStatusText) return;
-  curStatusKind = kind; curStatusText = text;
-  statusDot.className = "dot " + kind;
-  statusText.textContent = text;
-}
-
 let applyingRemote = false;
-let saveInFlight = false;
-let saveTimer = null;
 // Pending local ops keyed to flush together.
-let pendingCellOps = new Map(); // "sheetId!REF" -> { sheetId, ref, value, fmt }
-let pendingStructure = null;    // latest structure snapshot to send
-let pendingReplacements = new Map(); // sheetId -> cells (full)
+const pendingCellOps = new Map(); // "sheetId!REF" -> { sheetId, ref, value, fmt }
+let pendingStructure = null;      // latest structure snapshot to send
+const pendingReplacements = new Map(); // sheetId -> cells (full)
 
 function queueCellOp(sheetId, ref, value, fmt) {
   pendingCellOps.set(sheetId + "!" + ref, { sheetId, ref, value, fmt });
@@ -1326,58 +1247,59 @@ function queueReplacement(sheetId) {
   scheduleSave();
 }
 
-function scheduleSave(delay = 180) {
+// Debounces, serializes and retries the operation below, and owns the status line.
+const saver = new SaveScheduler({
+  debounceMs: 180,
+  save: sendPendingOperation,
+  isDirty: () => pendingCellOps.size > 0 || pendingStructure !== null || pendingReplacements.size > 0,
+  onStatus: (kind, message) => saveStatus.set(kind, message),
+});
+
+function scheduleSave() {
   if (applyingRemote) return;
-  setStatus("saving", "Saving…");
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(doSave, delay);
+  saver.schedule();
 }
 
-async function doSave() {
-  clearTimeout(saveTimer);
-  if (saveInFlight) return;
-  if (!pendingCellOps.size && !pendingStructure && !pendingReplacements.size) { setStatus("saved", "Saved"); return; }
+// Sends everything queued as one operation and adopts what the server acknowledged.
+async function sendPendingOperation() {
+  const sentCellOps = [...pendingCellOps];
+  const sentStructure = pendingStructure;
+  const sentReplacements = [...pendingReplacements];
+  if (!sentCellOps.length && !sentStructure && !sentReplacements.length) return "saved";
 
-  const cellOps = [];
-  for (const op of pendingCellOps.values()) {
+  const cellOps = sentCellOps.map(([, op]) => {
     const cur = (model.cells[op.sheetId] || {})[op.ref];
-    cellOps.push({ sheetId: op.sheetId, ref: op.ref, value: op.value, fmt: op.fmt, baseVersion: op.baseVersion || (cur ? cur.version : 0) });
-  }
-  const structure = pendingStructure;
-  const sheetReplacements = Array.from(pendingReplacements.entries()).map(([sheetId, cells]) => ({ sheetId, cells }));
-  pendingCellOps = new Map();
-  pendingStructure = null;
-  pendingReplacements = new Map();
+    return { sheetId: op.sheetId, ref: op.ref, value: op.value, fmt: op.fmt, baseVersion: op.baseVersion || (cur ? cur.version : 0) };
+  });
+  const sheetReplacements = sentReplacements.map(([sheetId, cells]) => ({ sheetId, cells }));
+  const result = await gadget.applyOperation({
+    senderId: clientId, structure: sentStructure, cellOps, sheetReplacements,
+  });
 
-  saveInFlight = true;
-  try {
-    const result = await gadget.applyOperation({ senderId: clientId, structure, cellOps, sheetReplacements });
-    model.revision = Math.max(model.revision, result.revision || 0);
-    // Adopt acknowledged versions.
-    for (const up of result.upserts || []) {
-      const cells = model.cells[up.sheetId] || (model.cells[up.sheetId] = {});
-      cells[up.ref] = { ...up.cell };
-    }
-    for (const del of result.deletes || []) { const cells = model.cells[del.sheetId]; if (cells) delete cells[del.ref]; }
-    if (result.status === "conflict" && result.conflicts) {
-      // Rebase: adopt server versions, then re-queue our local intents.
-      for (const cf of result.conflicts) {
-        const cells = model.cells[cf.sheetId] || (model.cells[cf.sheetId] = {});
-        cells[cf.ref] = { ...cf.cell };
-      }
-      setStatus("synced", "Resolving edit…");
-      scheduleSave(40);
-    } else {
-      setStatus("saved", "Saved");
-    }
-    rebuildEngine();
-  } catch (e) {
-    console.error(e);
-    setStatus("bad", "Save failed");
-  } finally {
-    saveInFlight = false;
-    if (pendingCellOps.size || pendingStructure || pendingReplacements.size) scheduleSave(40);
+  // Only what this call carried leaves the queue: an edit made while it was in flight
+  // replaced its entry and stays pending, and a rejected call leaves everything queued
+  // for the scheduler's retry.
+  for (const [key, op] of sentCellOps) if (pendingCellOps.get(key) === op) pendingCellOps.delete(key);
+  if (pendingStructure === sentStructure) pendingStructure = null;
+  for (const [sheetId, cells] of sentReplacements) {
+    if (pendingReplacements.get(sheetId) === cells) pendingReplacements.delete(sheetId);
   }
+
+  model.revision = Math.max(model.revision, result.revision || 0);
+  // Adopt acknowledged versions.
+  for (const up of result.upserts || []) {
+    const cells = model.cells[up.sheetId] || (model.cells[up.sheetId] = {});
+    cells[up.ref] = { ...up.cell };
+  }
+  for (const del of result.deletes || []) { const cells = model.cells[del.sheetId]; if (cells) delete cells[del.ref]; }
+  const conflicts = result.status === "conflict" && result.conflicts ? result.conflicts : [];
+  // Rebase on the server's version of every cell it rejected.
+  for (const cf of conflicts) {
+    const cells = model.cells[cf.sheetId] || (model.cells[cf.sheetId] = {});
+    cells[cf.ref] = { ...cf.cell };
+  }
+  rebuildEngine();
+  return conflicts.length ? "conflict" : "saved";
 }
 
 // ===========================================================================
@@ -1897,9 +1819,9 @@ function moveActive(r, c, extend = false) {
   if (!extend) anchor = { r: p.r, c: p.c };
   updateSelectionUI();
   scrollActiveIntoView();
-  sendPresence();
+  presence.schedule();
 }
-function setSelection(a, f) { anchor = { ...a }; focus = { ...f }; updateSelectionUI(); sendPresence(); }
+function setSelection(a, f) { anchor = { ...a }; focus = { ...f }; updateSelectionUI(); presence.schedule(); }
 
 function updateSelectionUI() {
   const rng = selRange();
@@ -2067,7 +1989,7 @@ gridTable.addEventListener("mousedown", (e) => {
   if (td) {
     const r = +td.dataset.r, c = +td.dataset.c;
     if (editing) commitEdit("none");
-    if (e.shiftKey) { focus = { r, c }; updateSelectionUI(); sendPresence(); }
+    if (e.shiftKey) { focus = { r, c }; updateSelectionUI(); presence.schedule(); }
     else moveActive(r, c);
     mouseSelecting = "cell";
     gridScroll.focus();
@@ -2086,7 +2008,7 @@ gridTable.addEventListener("mousemove", (e) => {
   else { focus = { r, c }; }
   updateSelectionUI();
 });
-window.addEventListener("mouseup", () => { if (mouseSelecting) { mouseSelecting = false; sendPresence(); } });
+window.addEventListener("mouseup", () => { if (mouseSelecting) { mouseSelecting = false; presence.schedule(); } });
 
 gridTable.addEventListener("dblclick", (e) => {
   const td = e.target.closest("td.cell");
@@ -2189,7 +2111,7 @@ function moveWithinSelection(dir, mode) {
   let { r, c } = focus;
   if (mode === "h") { c += dir; if (c > rng.c2) { c = rng.c1; r++; if (r > rng.r2) r = rng.r1; } if (c < rng.c1) { c = rng.c2; r--; if (r < rng.r1) r = rng.r2; } }
   else { r += dir; if (r > rng.r2) { r = rng.r1; c++; if (c > rng.c2) c = rng.c1; } if (r < rng.r1) { r = rng.r2; c--; if (c < rng.c1) c = rng.c2; } }
-  focus = { r, c }; updateSelectionUI(); scrollActiveIntoView(); sendPresence();
+  focus = { r, c }; updateSelectionUI(); scrollActiveIntoView(); presence.schedule();
 }
 function deleteSelectionContents() {
   const r = selRange();
@@ -2379,7 +2301,7 @@ function switchSheet(id) {
   activeSheetId = id;
   anchor = { r: 0, c: 0 }; focus = { r: 0, c: 0 };
   renderTabs(); renderGrid(); updateSelectionUI();
-  sendPresence();
+  presence.schedule();
 }
 function addSheet() {
   const id = "s_" + Math.random().toString(36).slice(2, 8);
@@ -2427,39 +2349,17 @@ function deleteSheet(id) {
 }
 
 // ===========================================================================
-// Inline prompt/dialog (alert/prompt blocked in sandbox iframe)
-// ===========================================================================
-function promptInline(message, def = "") {
-  return new Promise((resolve) => {
-    const input = el("input", { value: def });
-    const ok = el("button", { class: "primary" }, "OK");
-    const cancel = el("button", {}, "Cancel");
-    const dialog = el("div", { class: "dialog" }, [
-      el("div", { class: "msg" }, message), input,
-      el("div", { class: "row" }, [cancel, ok]),
-    ]);
-    const overlay = el("div", { class: "overlay" }, [dialog]);
-    document.body.appendChild(overlay);
-    input.focus(); input.select();
-    const done = (v) => { overlay.remove(); resolve(v); };
-    ok.addEventListener("click", () => done(input.value));
-    cancel.addEventListener("click", () => done(null));
-    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) done(null); });
-    input.addEventListener("keydown", (e) => { if (e.key === "Enter") done(input.value); if (e.key === "Escape") done(null); });
-  });
-}
-
-// ===========================================================================
 // Presence
 // ===========================================================================
-let presenceTimer = null;
-function sendPresence() {
-  clearTimeout(presenceTimer);
-  presenceTimer = setTimeout(() => {
+// Reports this tab's selected range: throttled while it moves, on the library's
+// heartbeat while it does not, which is also when the roster forgets the silent.
+const presence = new PresenceReporter(
+  () => {
     const rng = selRange();
-    gadget.updatePresence({ clientId, name: collaboratorName, color: collaboratorColor, sheetId: activeSheetId, r1: rng.r1, c1: rng.c1, r2: rng.r2, c2: rng.c2 }).catch(() => {});
-  }, 60);
-}
+    return { ...me, sheetId: activeSheetId, r1: rng.r1, c1: rng.c1, r2: rng.r2, c2: rng.c2 };
+  },
+  (update) => gadget.updatePresence(update),
+);
 function renderPeers() {
   // Presence UI disabled — single-user gadget, no collaborator badges shown.
 }
@@ -2467,35 +2367,29 @@ function renderPresence() {
   // Presence UI disabled — no remote selection boxes shown.
   remoteLayer.replaceChildren();
   return;
-  for (const p of collaborators.values()) {
-    if (p.sheetId !== activeSheetId) continue;
+  for (const person of roster.entries()) {
+    const p = person.cursor;
+    if (!p || p.sheetId !== activeSheetId) continue;
     const r1 = Math.min(p.r1, p.r2), r2 = Math.max(p.r1, p.r2), c1 = Math.min(p.c1, p.c2), c2 = Math.max(p.c1, p.c2);
     const tdA = cellEl(r1, c1), tdB = cellEl(r2, c2);
     if (!tdA || !tdB) continue;
     const left = tdA.offsetLeft, top = tdA.offsetTop;
     const width = tdB.offsetLeft + tdB.offsetWidth - left, height = tdB.offsetTop + tdB.offsetHeight - top;
     const fill = el("div", { class: "remote-fill" });
-    fill.style.cssText = `left:${left}px;top:${top}px;width:${width}px;height:${height}px;background:${p.color}`;
+    fill.style.cssText = `left:${left}px;top:${top}px;width:${width}px;height:${height}px;background:${person.color}`;
     const box = el("div", { class: "remote-box" });
-    box.style.cssText = `left:${left}px;top:${top}px;width:${width}px;height:${height}px;border-color:${p.color}`;
-    const tag = el("div", { class: "remote-tag" }, p.name);
-    tag.style.cssText = `left:${left}px;top:${top}px;background:${p.color}`;
+    box.style.cssText = `left:${left}px;top:${top}px;width:${width}px;height:${height}px;border-color:${person.color}`;
+    const tag = el("div", { class: "remote-tag" }, person.name);
+    tag.style.cssText = `left:${left}px;top:${top}px;background:${person.color}`;
     remoteLayer.appendChild(fill); remoteLayer.appendChild(box); remoteLayer.appendChild(tag);
   }
 }
 function applyPresence(event) {
-  if (!event?.clientId || event.clientId === clientId) return;
-  if (event.type === "leave") collaborators.delete(event.clientId);
-  else collaborators.set(event.clientId, { ...event, seenAt: Date.now() });
+  if (!roster.apply(event)) return;
   renderPresence(); renderPeers();
 }
 gridScroll.addEventListener("scroll", () => { renderPresence(); });
-setInterval(() => {
-  sendPresence();
-  const cutoff = Date.now() - 12000; let changed = false;
-  for (const [id, p] of collaborators) if ((p.seenAt || 0) < cutoff) { collaborators.delete(id); changed = true; }
-  if (changed) { renderPresence(); renderPeers(); }
-}, 4000);
+presence.startHeartbeat(() => { if (roster.expire()) { renderPresence(); renderPeers(); } });
 window.addEventListener("pagehide", () => { gadget.leavePresence(clientId).catch(() => {}); });
 
 // ===========================================================================
@@ -2516,8 +2410,8 @@ function applyRemoteOperation(event) {
   rebuildEngine();
   if (!model.sheets[activeSheetId]) activeSheetId = model.sheetOrder[0];
   renderTabs(); renderGrid();
-  setStatus("synced", "Live update");
-  setTimeout(() => { if (!saveInFlight && !pendingCellOps.size) setStatus("saved", "Saved"); }, 900);
+  saveStatus.set("synced", "Live update");
+  setTimeout(() => { if (!saver.busy && !pendingCellOps.size) saveStatus.set("saved", "Saved"); }, 900);
 }
 function applyStructure(s) {
   if (s.title != null && document.activeElement !== titleInput) { model.title = s.title; titleInput.value = s.title; }
@@ -2543,24 +2437,25 @@ function applySnapshot(doc) {
   updateSelectionUI();
 }
 
-class SheetCallbacks extends RpcTarget {
-  operation(event) { if (event.type === "snapshot") applySnapshot(event.document); else applyRemoteOperation(event); }
-  presence(event) { applyPresence(event); }
-}
+// What the Durable Object calls back on; the library puts these on an RpcTarget.
+const subscriber = createSubscriber(RpcTarget, {
+  operation(event) { if (event.type === "snapshot") applySnapshot(event.document); else applyRemoteOperation(event); },
+  presence(event) { applyPresence(event); },
+});
 
 // ===========================================================================
 // Init
 // ===========================================================================
 
   try {
-    const doc = await gadget.subscribe(new SheetCallbacks(), { clientId, name: collaboratorName, color: collaboratorColor });
+    const doc = await gadget.subscribe(subscriber, me);
     applySnapshot(doc);
-    setStatus("saved", "Saved");
+    saveStatus.set("saved", "Saved");
     updateUndoButtons();
-    sendPresence();
+    presence.schedule();
     gridScroll.focus();
   } catch (e) {
     console.error(e);
-    setStatus("bad", "Offline");
+    saveStatus.set("bad", "Offline");
   }
 

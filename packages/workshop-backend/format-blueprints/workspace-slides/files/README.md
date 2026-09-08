@@ -14,6 +14,41 @@ neutral sidebars so the slide canvas remains the visual focus.
 - `client.js` — Design tokens, the component registry, slide renderer,
   block interactions (drag, resize, inline text edit), and the builder
   shell (slide list, inspector, palette, control bar, present mode).
+- `gadget.json` — which shared gadget libraries this deck loads, and where
+  from.
+
+## Gadget libraries
+
+Three pieces of this deck are not its own: the element builder, the two
+steps that read an uploaded image, and the object the Durable Object calls
+back. They are shared with the other document-style gadgets and are
+imported from the libraries the deployment ships:
+
+```js
+import { el, loadImage, readFileAsDataURL } from "gadgets:ui/client";
+import { createSubscriber } from "gadgets:sync/client";   // client.js
+import { SubscriberRegistry } from "gadgets:sync/server"; // server.js
+```
+
+- **`ui`** — `el(tag, props, children)` builds every element in
+  `client.js`; `readFileAsDataURL` and `loadImage` are the two halves of
+  `fileToImageDataURL`, whose encoding rule (SVG verbatim, PNG kept as PNG,
+  the original on any canvas failure) stays here because it is the deck's.
+  The library's own icons, toolbar controls and prompt are for the gadgets
+  with a formatting bar; this deck draws its own `ICONS` as complete SVGs
+  and has no toolbar of that shape, so it imports none of them.
+- **`sync`** — `createSubscriber(RpcTarget, { deckChanged })` builds the
+  callback target (the RPC layer only calls prototype methods, which is
+  what the library gets right), and `SubscriberRegistry` holds the
+  connected browsers in the Durable Object. A deck has no presence — every
+  viewer sees the same slides and no cursors are shared — so the registry
+  is built with no presence hooks and is a plain fan-out.
+
+`gadget.json` pins both to `latest`, the bundles the running deployment
+serves, so a deck created from it follows the library the deployment ships.
+Everything else here — the tokens, the `COMPONENTS` registry, the layout and
+snapping code, the deck document and its undo history — is this blueprint's,
+and a library change may not alter what a viewer sees.
 
 ## Slide formats
 
@@ -81,7 +116,7 @@ hanging-indent treatment: one item per source line, 6px Tangerine dots,
 12px dot-to-copy gap, 19px primary or 17px compact Inter Regular text, and
 controlled 10px/8px item spacing.
 
-## Data model## Initial blueprint
+## Initial blueprint
 
 New Gadget instances start from the current four-slide overview of the
 builder: the orange “Compose your deck or build with agent” cover, a six-part
@@ -208,6 +243,10 @@ is `deckChanged(deck, meta)` where `meta = { canUndo, canRedo }` reflects
 the current server-side history state. The client preserves the currently-
 selected slide & block across updates when possible.
 
+The registry behind `#broadcast` isolates subscribers from each other: one
+whose call fails is dropped and its stub released rather than failing the
+mutation being broadcast, and so is one whose connection breaks.
+
 ## Undo / redo
 
 The undo stack lives on the server (in `Gadget`, in memory only — lost on
@@ -281,11 +320,12 @@ need to touch styles when adding a new field type.
 - **Image** blocks store their data inside `props.src` as either an
   external URL (loaded normally by `<img>` — note this is one of the few
   network paths the sandbox still allows) or as an inlined `data:` URI.
-  Uploads are read via `FileReader`, and raster images larger than
-  `MAX_IMAGE_DIM` (1600px on the longest side) are downscaled on canvas
-  before being inlined, so the deck JSON doesn't balloon. SVG files are
-  passed through verbatim. The custom `image` field type in
-  `renderField` renders the preview + upload/clear buttons + URL input.
+  Uploads are read with the `ui` library's `readFileAsDataURL`, and raster
+  images larger than `MAX_IMAGE_DIM` (1600px on the longest side) are
+  downscaled on canvas before being inlined, so the deck JSON doesn't
+  balloon. SVG files are passed through verbatim. The custom `image` field
+  type in `renderField` renders the preview + upload/clear buttons + URL
+  input.
 - **SVG** blocks store raw markup in `props.markup`. `render()` parses
   it with the DOM parser, strips `<script>` elements and `on*` attributes,
   then forces `width="100%" height="100%"` and a `preserveAspectRatio`

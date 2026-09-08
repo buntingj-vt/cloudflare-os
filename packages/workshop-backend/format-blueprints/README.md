@@ -13,10 +13,9 @@ workspace-docs/
   blueprint.json
   files/
     README.md
-    client.js
-    lib/
-      helpers.js
-    server.js
+    client.js         import { el, iconBtn } from "gadgets:ui/client"
+    server.js         import { MutationQueue } from "gadgets:sync/server"
+    gadget.json       {"libraries": {"sync": "latest", "ui": "latest"}}
 ```
 
 `files/` is the gadget's code and may contain nested directories. `blueprint.json` contains its
@@ -24,6 +23,27 @@ install ID, presentation, provenance,
 bindings, blueprint `version`, and bundled `revision`. The build converts these files into the same
 gzip-compressed Yjs `.gadget` representation used by uploaded blueprints and embeds it in the
 generated Worker module. No binary archive is committed.
+
+### Libraries
+
+A blueprint may import a **gadget library** -- shared code the deployment ships, `gadgets:<name>/client`
+and `gadgets:<name>/server`, built from `packages/gadget-libraries/<name>/` (see that package's
+README and `docs/blueprints.md`). Its `files/gadget.json` names each library it imports:
+
+```json
+{"libraries": {"sync": "latest", "ui": "latest"}}
+```
+
+A gadget pins every library it loads, *transitively*: a library that imports another makes the
+gadget pin both, and the build says which pin is missing when it is not.
+
+The build checks the two against each other: every `gadgets:` import reachable from `client.js` or
+`server.js` must be pinned, must name the side it is imported from (a client may not import
+`gadgets:x/server`), and must name a library that exists in `packages/gadget-libraries`; and every
+pin must be imported by something. The import survives into the archive, and the Workshop resolves
+it when it loads the gadget. The Docs, Sheets and Slides blueprints are built on the `ui` and `sync`
+libraries, with their own domain code in `files/`; the agent learns a library's interface through its
+`describeGadgetLibrary` tool.
 
 `blueprintId` is the install key. Never change it after deployment: the new ID would install a
 second format while the old one remained. `version` is the blueprint's published content version

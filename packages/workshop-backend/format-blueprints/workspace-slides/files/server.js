@@ -1,4 +1,5 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { SubscriberRegistry } from "gadgets:sync/server";
 
 /**
  * The Gadget stores a single "deck" document under the "deck" key:
@@ -23,6 +24,12 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
  * store with realtime broadcast. Mutations are coarse: any change re-sends
  * the whole deck, which keeps clients trivially in sync and makes undo
  * (future) easy.
+ *
+ * The connected browsers are held by the sync library's SubscriberRegistry.
+ * A deck has no presence — everyone sees the same slide data and cursors are
+ * not shared — so the registry is built with no presence hooks and is a plain
+ * fan-out: it keeps each subscriber's stub, drops and releases one whose
+ * connection breaks or whose delivery fails, and isolates the rest from it.
  */
 
 const STORAGE_KEY = "deck";
@@ -32,7 +39,7 @@ export class Gadget extends DurableObject {
   constructor(state, env) {
     super(state, env);
     this.state = state;
-    this.subscribers = new Set();
+    this.subscribers = new SubscriberRegistry();
     // Undo/redo stacks live in memory only — they're transient and
     // shared across every connected client (one global history for the
     // whole deck). On DO restart history is lost, which we consider
@@ -199,9 +206,7 @@ export class Gadget extends DurableObject {
 
   // -------- realtime ------------------------------------------------------
   async subscribe(cb) {
-    const dup = cb.dup();
-    this.subscribers.add(dup);
-    dup.onRpcBroken(() => this.subscribers.delete(dup));
+    this.subscribers.add(cb);
   }
 
   async #save(deck) {
@@ -224,10 +229,7 @@ export class Gadget extends DurableObject {
       canUndo: this.undoStack.length > 0,
       canRedo: this.redoStack.length > 0,
     };
-    for (const sub of this.subscribers) {
-      try { sub.deckChanged(deck, meta); }
-      catch (e) { this.subscribers.delete(sub); }
-    }
+    await this.subscribers.broadcast(sub => sub.deckChanged(deck, meta));
   }
 }
 

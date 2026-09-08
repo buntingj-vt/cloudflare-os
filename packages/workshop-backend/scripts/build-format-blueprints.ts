@@ -96,6 +96,10 @@ let sources = [
   ...legacyNames.map(name => ({name, kind: "legacy" as const})),
 ].toSorted((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
 validatePortablePaths(sources.map(source => source.name), sourceDir);
+// A blueprint may only pin a library this deployment bundles, and must pin what those import; the
+// generated module is what knows each library's imports, since they are found while bundling.
+let libraries = new Map((await import("../src/generated/gadget-libraries.ts")).GADGET_LIBRARIES
+    .map(library => [library.name, library.dependencies]));
 for (let source of sources) {
   let {name} = source;
   let raw: string;
@@ -112,7 +116,8 @@ for (let source of sources) {
     let manifest = parseFormatBlueprintManifest(name, raw);
     let {created, version, lastUpdated, bindings, ...presentation} = manifest;
     entry = presentation;
-    let sourceFiles = await readSourceFiles(join(sourceDir, directory, "files"), `${name}/files`);
+    let sourceFiles = await readSourceFiles(join(sourceDir, directory, "files"), `${name}/files`,
+        {libraries});
     let metadata = {
       title: manifest.title,
       description: manifest.description,

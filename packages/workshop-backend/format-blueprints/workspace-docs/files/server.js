@@ -1,4 +1,16 @@
+// The document's Durable Object. The collaboration plumbing -- the mutation
+// queue, the subscribed browsers, and the per-block optimistic concurrency --
+// is the sync library's; the block model, the ordering rule, the legacy
+// conversion and the Markdown export are this gadget's own.
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import {
+  MutationQueue,
+  SubscriberRegistry,
+  applyVersioned,
+  normalizeBaseVersion,
+  normalizeCollaborator,
+  operationStatus,
+} from "gadgets:sync/server";
 
 const DEFAULT_TITLE = "Untitled document";
 
@@ -6,16 +18,17 @@ export class Gadget extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.ctx = ctx;
-    this.subscribers = new Map();
     // RPC calls may overlap at await points. Chain mutations so each operation
     // observes and commits one authoritative document state in strict order.
-    this.mutationQueue = Promise.resolve();
-  }
-
-  enqueueMutation(fn) {
-    const result = this.mutationQueue.then(fn);
-    this.mutationQueue = result.catch(() => {});
-    return result;
+    this.mutations = new MutationQueue();
+    // Presence is announced in this gadget's own callback vocabulary: a caret
+    // with no position yet on arrival, and a bare id on departure.
+    this.subscribers = new SubscriberRegistry({
+      join: (subscriber, who) => subscriber.presence({
+        type: "join", clientId: who.clientId, name: who.name, color: who.color, blockId: null,
+      }),
+      leave: (subscriber, who) => subscriber.presence({ type: "leave", clientId: who.clientId }),
+    });
   }
 
   async loadDocument() {
@@ -43,7 +56,7 @@ export class Gadget extends DurableObject {
   }
 
   initializeBlocks(args) {
-    return this.enqueueMutation(() => this.initializeBlocksLocked(args));
+    return this.mutations.run(() => this.initializeBlocksLocked(args));
   }
 
   async initializeBlocksLocked({ blocks, title, senderId }) {
@@ -82,7 +95,7 @@ export class Gadget extends DurableObject {
   // this always applies, so callers never need to inspect revision state or
   // construct per-block applyOperation payloads just to populate a document.
   setDocument(args) {
-    return this.enqueueMutation(() => this.setDocumentLocked(args));
+    return this.mutations.run(() => this.setDocumentLocked(args));
   }
 
   async setDocumentLocked({ blocks, title, senderId }) {
@@ -107,42 +120,35 @@ export class Gadget extends DurableObject {
   // Apply a compact batch of block changes. The mutation queue is the single
   // authoritative order for all collaborators.
   applyOperation(operation) {
-    return this.enqueueMutation(() => this.applyOperationLocked(operation));
+    return this.mutations.run(() => this.applyOperationLocked(operation));
   }
 
   async applyOperationLocked(operation) {
     let doc = await this.ctx.storage.get("document:v2");
     if (!doc) throw new Error("Document must be initialized first.");
 
-    const byId = new Map(doc.blocks.map((block) => [block.id, block]));
-    const accepted = [];
-    const conflicts = [];
-
-    for (const incoming of sanitizeBlocks(operation.upserts || [])) {
-      const current = byId.get(incoming.id);
-      const expected = Number(incoming.baseVersion || 0);
-      if (current && expected !== current.version) {
-        conflicts.push(current);
-        continue;
-      }
-      if (!current && expected !== 0) continue;
-      const next = { id: incoming.id, html: incoming.html, version: (current?.version || 0) + 1 };
-      byId.set(next.id, next);
-      accepted.push(next);
-    }
-
-    const deletedIds = [];
-    for (const deletion of operation.deletes || []) {
-      const id = String(deletion?.id || "");
-      const current = byId.get(id);
-      if (!current) continue;
-      if (Number(deletion.baseVersion || 0) !== current.version) {
-        conflicts.push(current);
-        continue;
-      }
-      byId.delete(id);
-      deletedIds.push(id);
-    }
+    const outcome = applyVersioned(doc.blocks, {
+      upserts: sanitizeBlocks(operation.upserts || []),
+      deletes: (operation.deletes || []).map((deletion) => ({
+        id: String(deletion?.id || ""),
+        baseVersion: normalizeBaseVersion(deletion?.baseVersion),
+      })),
+    }, {
+      // Every accepted upsert takes a new version, even one whose HTML already
+      // matches what is stored: the reply is how a client learns which version
+      // its draft now rests on, and a block left out of it would keep looking
+      // unsaved to the sender.
+      isUnchanged: () => false,
+    });
+    const byId = outcome.items;
+    const { accepted, deletedIds } = outcome;
+    // A rejection travels as the authoritative block, which the client rebases
+    // its draft onto. An upsert naming a block someone else deleted has nothing
+    // to rebase onto and is dropped instead: the client re-creates it from its
+    // draft on the next save, with no base version.
+    const conflicts = outcome.conflicts
+      .filter((conflict) => conflict.reason === "stale")
+      .map((conflict) => conflict.current);
 
     // Ordering is intentionally last-writer-wins. Text/content remains guarded
     // by per-block versions, while inserts, moves and list restructuring stay
@@ -161,11 +167,11 @@ export class Gadget extends DurableObject {
     }
 
     const titleChanged = typeof operation.title === "string" && operation.title !== doc.title;
-    const changed = accepted.length || deletedIds.length || titleChanged ||
+    const changed = outcome.changed || titleChanged ||
       order.join("\n") !== doc.blocks.map((b) => b.id).join("\n");
 
     if (!changed) {
-      return { status: conflicts.length ? "conflict" : "unchanged", revision: doc.revision, conflicts };
+      return { status: operationStatus(false, conflicts), revision: doc.revision, conflicts };
     }
 
     doc = {
@@ -188,37 +194,16 @@ export class Gadget extends DurableObject {
     };
     await this.broadcast(event);
     return {
-      status: conflicts.length ? "conflict" : "applied",
+      status: operationStatus(true, conflicts),
       ...event,
       conflicts,
     };
   }
 
   async subscribe(callback, client = {}) {
-    const dup = callback.dup();
-    const existing = Array.from(this.subscribers.values());
-    const info = {
-      callback: dup,
-      clientId: String(client.clientId || ""),
-      name: String(client.name || "Guest").slice(0, 40),
-      color: String(client.color || "#e1632e"),
-    };
-    this.subscribers.set(dup, info);
-    dup.onRpcBroken(() => {
-      this.subscribers.delete(dup);
-      this.broadcastPresence({ type: "leave", clientId: info.clientId });
-    });
-    queueMicrotask(async () => {
-      // Seed the newcomer with collaborators who were already connected.
-      for (const person of existing) {
-        try {
-          await dup.presence({ type: "join", clientId: person.clientId, name: person.name, color: person.color, blockId: null });
-        } catch (e) { break; }
-      }
-      await this.broadcastPresence({
-        type: "join", clientId: info.clientId, name: info.name, color: info.color, blockId: null,
-      });
-    });
+    // The registry keeps the stub, seeds the newcomer with everyone already
+    // connected, announces it to them, and drops it when its connection breaks.
+    this.subscribers.add(callback, normalizeCollaborator(client));
     return this.loadDocument();
   }
 
@@ -250,19 +235,11 @@ export class Gadget extends DurableObject {
   }
 
   async broadcast(event) {
-    const calls = [];
-    for (const [stub] of this.subscribers) {
-      calls.push(Promise.resolve(stub.operation(event)).catch(() => this.subscribers.delete(stub)));
-    }
-    await Promise.all(calls);
+    await this.subscribers.broadcast((subscriber) => subscriber.operation(event));
   }
 
   async broadcastPresence(event) {
-    const calls = [];
-    for (const [stub] of this.subscribers) {
-      calls.push(Promise.resolve(stub.presence(event)).catch(() => this.subscribers.delete(stub)));
-    }
-    await Promise.all(calls);
+    await this.subscribers.broadcast((subscriber) => subscriber.presence(event));
   }
 
   async getGoogleDocInfo() {
@@ -291,7 +268,7 @@ function sanitizeBlocks(blocks) {
     const html = String(value?.html || "");
     if (!id || seen.has(id) || html.length > 10_000_000) continue;
     seen.add(id);
-    result.push({ id, html, baseVersion: Number(value?.baseVersion || 0) });
+    result.push({ id, html, baseVersion: normalizeBaseVersion(value?.baseVersion) });
   }
   return result;
 }

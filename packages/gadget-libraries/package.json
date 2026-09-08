@@ -1,0 +1,29 @@
+{
+  "name": "@gadgets/gadget-libraries",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Libraries a gadget imports as `gadgets:<name>/client` and `gadgets:<name>/server`. Bundled by the Workshop backend; not a deployable Worker and never imported by one.",
+  "type": "module",
+  "exports": {
+    "./sync/client": "./sync/client.ts",
+    "./sync/server": "./sync/server.ts",
+    "./sync/library.json": "./sync/library.json",
+    "./sync/*": "./sync/src/*.ts",
+    "./ui/client": "./ui/client.ts",
+    "./ui/server": "./ui/server.ts",
+    "./ui/library.json": "./ui/library.json",
+    "./ui/*": "./ui/src/*.ts"
+  },
+  "scripts": {
+    "test:run": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "catalog:",
+    "@gadgets/scripts": "workspace:*",
+    "@types/node": "^26.1.0",
+    "jsdom": "^26.1.0",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

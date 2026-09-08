@@ -6,6 +6,12 @@ import type { Dirent } from "node:fs";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { join } from "node:path";
 import * as Y from "yjs";
+import {
+  type GadgetPins,
+  LIBRARY_SIDES,
+  parseLibrarySpecifier,
+  readPins,
+} from "../src/gadget-libraries.ts";
 
 const MAGIC = 0xec2e2d3a2300e317n;
 const VERSION = 1;
@@ -144,9 +150,17 @@ export function buildContent(files: Map<string, string>, label: string): Uint8Ar
   return gzipSync(update, {level: 9});
 }
 
+/**
+ * Reads a blueprint's files/ tree into the file map its archive will hold.
+ *
+ * Every regular file under `filesDir` is read as UTF-8 and validated as a portable archive path,
+ * and the tree's gadget-library imports are checked against its `gadget.json` pins (see
+ * {@link checkLibraryPins}).
+ */
 export async function readSourceFiles(
   filesDir: string,
   label: string,
+  options: ReadSourceOptions = {},
 ): Promise<Map<string, string>> {
   const files = new Map<string, string>();
   let totalBytes = 0;
@@ -178,7 +192,158 @@ export async function readSourceFiles(
 
   await visit(filesDir, "");
   validateFilePaths(files.keys(), label);
+  checkLibraryPins(files, label, options.libraries);
   return files;
+}
+
+export type ReadSourceOptions = {
+  /**
+   * The libraries the deployment bundles, each with the names of the libraries it imports (see
+   * scripts/gadget-libraries-source.ts). When given, a pin naming any other library fails the
+   * build, and a library's own dependencies must be pinned too; when omitted -- the archive tests,
+   * and an importer that only needs the files -- only the blueprint's direct imports are checked.
+   */
+  libraries?: ReadonlyMap<string, readonly string[]>;
+};
+
+/** The files the reachability scan reads: those that can name another module. */
+const MODULE_PATTERN = /\.[cm]?js$/u;
+
+/**
+ * Every string literal that could be a module specifier: the operand of `from`, of `import` or
+ * `import()`, or of `require()`.
+ */
+const SPECIFIER_PATTERN = /\b(?:from|import|require)\s*\(?\s*(?:"([^"\n]*)"|'([^'\n]*)')/gu;
+
+/**
+ * Checks that a blueprint's library imports and its `gadget.json` pins agree.
+ *
+ * Every `gadgets:<name>/<side>` a side's entry reaches must be pinned, must name that side (a
+ * client that imports `gadgets:x/server` would drag a Durable Object into the iframe), and when
+ * `libraries` is given must name a library the deployment ships -- and so must every library those
+ * import, transitively, since a library's own `gadgets:` imports resolve through the pins of the
+ * gadget loading it; and every pin must be imported by something, directly or through a library,
+ * since an unused pin would still be resolved on every load. The import scan is the over-estimate
+ * {@link importedModules} makes, so an unpinned specifier in a comment fails the build too; the
+ * fix is the pin or the comment.
+ */
+function checkLibraryPins(
+  files: ReadonlyMap<string, string>,
+  label: string,
+  libraries: ReadonlyMap<string, readonly string[]> | undefined,
+): void {
+  let pins: GadgetPins;
+  try {
+    pins = readPins(files);
+  } catch (err) {
+    invalid(label, errorMessage(err));
+  }
+  const imported = new Set<string>();
+  for (const side of LIBRARY_SIDES) {
+    for (const [importer, specifier] of libraryImports(files, `${side}.js`)) {
+      const parsed = parseLibrarySpecifier(specifier);
+      if (!parsed) {
+        invalid(label, `${importer} imports ${specifier}, which is not a library ` +
+            `(gadgets:<name>/client or gadgets:<name>/server)`);
+      }
+      if (parsed.side !== side) {
+        invalid(label, `${importer} imports ${specifier} from the ${side} side`);
+      }
+      if (!pins.has(parsed.name)) {
+        invalid(label, `${importer} imports ${specifier}, which gadget.json does not pin`);
+      }
+      if (libraries && !libraries.has(parsed.name)) {
+        invalid(label, `${importer} imports ${specifier}, but the deployment bundles no library ` +
+            `named ${parsed.name}`);
+      }
+      imported.add(parsed.name);
+    }
+  }
+  if (libraries) {
+    // What the imported libraries import in turn: the gadget pins those too.
+    for (const name of imported) {
+      for (const dependency of libraries.get(name) ?? []) {
+        if (imported.has(dependency)) continue;
+        if (!pins.has(dependency)) {
+          invalid(label, `gadget.json must also pin ${dependency}, which the ${name} library imports`);
+        }
+        imported.add(dependency);
+      }
+    }
+  }
+  for (const name of pins.keys()) {
+    if (!imported.has(name)) invalid(label, `gadget.json pins ${name}, which nothing imports`);
+  }
+}
+
+/**
+ * The `gadgets:` specifiers written in the files reachable from `entryPath`, each with the file
+ * that wrote it. The walk is {@link importedModules}'s, over the same specifier scan.
+ */
+function libraryImports(
+  files: ReadonlyMap<string, string>,
+  entryPath: string,
+): Array<[importer: string, specifier: string]> {
+  const found: Array<[string, string]> = [];
+  for (const path of importedModules(files, [entryPath])) {
+    const source = MODULE_PATTERN.test(path) ? files.get(path) : undefined;
+    if (source === undefined) continue;
+    for (const [, doubleQuoted, singleQuoted] of source.matchAll(SPECIFIER_PATTERN)) {
+      const specifier = doubleQuoted ?? singleQuoted!;
+      if (specifier.startsWith("gadgets:")) found.push([path, specifier]);
+    }
+  }
+  return found;
+}
+
+/**
+ * The blueprint's own files reachable from `entryPaths` by following relative import specifiers.
+ *
+ * A scan of the source rather than a parse of it, and deliberately so: a scan can only
+ * over-estimate what is imported (a specifier-shaped string in a comment counts), so a module
+ * something really does import is never missed.
+ */
+function importedModules(
+  files: ReadonlyMap<string, string>,
+  entryPaths: string[],
+): Set<string> {
+  const reached = new Set(entryPaths);
+  const queue = [...entryPaths];
+  for (let path = queue.pop(); path !== undefined; path = queue.pop()) {
+    const source = MODULE_PATTERN.test(path) ? files.get(path) : undefined;
+    if (source === undefined) continue;
+    for (const [, doubleQuoted, singleQuoted] of source.matchAll(SPECIFIER_PATTERN)) {
+      const specifier = doubleQuoted ?? singleQuoted!;
+      if (!specifier.startsWith("./") && !specifier.startsWith("../")) continue;
+      for (const candidate of resolveWithinFiles(path, specifier)) {
+        if (!files.has(candidate) || reached.has(candidate)) continue;
+        reached.add(candidate);
+        queue.push(candidate);
+      }
+    }
+  }
+  return reached;
+}
+
+/**
+ * The archive paths a relative `specifier` written in `importer` could name: the path as written,
+ * an omitted extension, or a directory's index module, since which one resolves is the runtime's
+ * business. A specifier reaching above files/ resolves to nothing here.
+ */
+function resolveWithinFiles(importer: string, specifier: string): string[] {
+  const segments = importer.split("/").slice(0, -1);
+  for (const segment of specifier.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment !== "..") {
+      segments.push(segment);
+      continue;
+    }
+    if (segments.length === 0) return [];
+    segments.pop();
+  }
+  const path = segments.join("/");
+  if (path === "") return [];
+  return [path, `${path}.js`, `${path}/index.js`];
 }
 
 function validateFilePaths(paths: Iterable<string>, label: string): void {

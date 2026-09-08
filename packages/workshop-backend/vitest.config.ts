@@ -42,6 +42,8 @@ export default defineConfig({
       miniflare: {
         compatibilityDate: '2026-09-04',
         compatibilityFlags: ['experimental', 'nodejs_compat'],
+        // The gadget-libraries suite loads a gadget through the real dynamic loader.
+        workerLoaders: { LOADER: {} },
         durableObjects: {
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },
         },
