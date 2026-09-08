@@ -73,15 +73,38 @@ export function resolveLibraries(pins: GadgetPins, side: LibrarySide): ResolvedL
  * the server side of every pinned library under the specifier the gadget imports it by. A library
  * wins over a same-named file, and workerd wants a typed module for a name that is not a `.js`
  * path. A pin that does not resolve throws, so the gadget fails to load like any broken one.
+ *
+ * workerd resolves a specifier against the importing module's name as if it were a path, so a bare
+ * `gadgets:sync/server` in `lib/impl.js` is looked up as `lib/gadgets:sync/server`. Every directory
+ * a gadget file sits in therefore gets a shim under that name for each library, re-exporting the
+ * root module, so the whole gadget shares one instance of the library -- one class identity, one
+ * module state -- whichever file imports it. The shim's own name is a path too, `lib/gadgets:sync/`
+ * being its directory, so it climbs one `../` per slash in its name: `lib/gadgets:sync/server` is
+ * `export * from "../../gadgets:sync/server"`. `export *` forwards no default export; the library
+ * build refuses a server bundle with one. Like the root specifier, a shim wins over a same-named
+ * gadget file.
  */
 export function gadgetWorkerModules(files: ReadonlyMap<string, string>)
     : {modules: WorkerLoaderWorkerCode["modules"], libraries: ResolvedLibrary[]} {
   const modules: WorkerLoaderWorkerCode["modules"] = {};
+  const directories = new Set<string>();
   for (const [file, content] of files) {
-    if (file.endsWith(".js")) modules[file] = content;
+    if (!file.endsWith(".js")) continue;
+    modules[file] = content;
+    const segments = file.split("/");
+    for (let depth = 1; depth < segments.length; depth++) {
+      directories.add(segments.slice(0, depth).join("/"));
+    }
   }
   const libraries = resolveLibraries(readPins(files), "server");
-  for (const {specifier, code} of libraries) modules[specifier] = {js: code};
+  for (const {specifier, code} of libraries) {
+    modules[specifier] = {js: code};
+    for (const directory of directories) {
+      const shim = `${directory}/${specifier}`;
+      const climb = "../".repeat(shim.split("/").length - 1);
+      modules[shim] = {js: `export * from "${climb}${specifier}";\n`};
+    }
+  }
   return {modules, libraries};
 }
 

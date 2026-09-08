@@ -3057,12 +3057,16 @@ export type AiToolCall = {
 } | {
   /**
    * Describe one of the chat's bindings by name. Numeric names appear only in logs persisted
-   * before named chat bindings (they were capsule indices).
+   * before named chat bindings (they were capsule indices). Read-only; the text is recorded so
+   * replay doesn't recompute it against a later head of the gadget (or a later deployment of a
+   * gatekeeper), and it describes the files the chat saw. Absent from logs before it was recorded,
+   * which replay recomputes as before.
    */
   toolName: "describeBinding";
   input: {
     name: string | number;
   };
+  output?: string;
 } | {
   toolName: "setBindingHook";
   input: {

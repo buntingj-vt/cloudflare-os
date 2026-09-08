@@ -361,19 +361,20 @@ export function describeGadgetLibrary(name: string, side?: LibrarySide): string 
 }
 
 // Resolves a `describeBinding` tool argument (a name in the chat's env) to its human-readable
-// description. Shared by the live tool and the replay path so the two can't drift. (Replay of
-// logs from before named chat bindings may pass a number -- a capsule index in the old numeric
-// env -- which no longer resolves; the model sees the same "no such binding" error it would get
-// if it used one today.)
+// description. Shared by the live tool and the replay of logs that predate the recorded output, so
+// the two can't drift. (Replay of logs from before named chat bindings may pass a number -- a
+// capsule index in the old numeric env -- which no longer resolves; the model sees the same "no
+// such binding" error it would get if it used one today.)
 async function resolveBindingDescription(
     name: string | number,
     chatBindings: Map<string, ChatBindingEntry>,
-    hooks: Pick<AgentHooks, "describeBinding">): Promise<string> {
+    hooks: Pick<AgentHooks, "describeBinding">,
+    chatId: number): Promise<string> {
   let entry = chatBindings.get(`${name}`);
   if (!entry) throw new Error(`There is no binding named "${name}" in your env.`);
   switch (entry.type) {
     case "workpiece":
-      return hooks.describeBinding(`env.${name}`, entry.id);
+      return hooks.describeBinding(`env.${name}`, entry.id, chatId);
     case "value":
       return `env.${name} holds the arguments of an agent callback: \`env.${name}.args\` is the ` +
           `arguments array, and \`env.${name}.resolve(value)\` / \`env.${name}.reject(error)\` ` +
@@ -569,9 +570,11 @@ export interface AgentHooks {
   /**
    * Describe a workpiece (a gadget or a gatekeeper) reachable as `envName` in the chat's env,
    * for the agent's describeBinding tool. (`envName` is provided here only so that it can be
-   * incorporated into the returned description.)
+   * incorporated into the returned description.) A gadget is described as `chatId` sees its files,
+   * proposed changes included; the tool records the text, so a later head does not change what the
+   * model was told.
    */
-  describeBinding(envName: string, id: WorkpieceId): Promise<string>;
+  describeBinding(envName: string, id: WorkpieceId, chatId: number): Promise<string>;
 
   /**
    * Add a binding to the given gadget, pointing at the given workpiece. The binding is provisional
@@ -1902,9 +1905,11 @@ export async function runAgent(
                   break;
                 }
                 case "describeBinding":
+                  // Recorded since the output was added; logs from before recompute it, against
+                  // whatever the binding is today.
                   toolOutput = {
-                    text: await resolveBindingDescription(
-                        toolCall.input.name, chatBindings, hooks),
+                    text: toolCall.output ?? await resolveBindingDescription(
+                        toolCall.input.name, chatBindings, hooks, chatId),
                   };
                   break;
                 case "setBindingHook":
@@ -2918,7 +2923,8 @@ export async function runAgent(
       }),
       execute: async (toolCallId, {name}) => {
         try {
-          return toolResult(await resolveBindingDescription(name, chatBindings, hooks));
+          let output = await resolveBindingDescription(name, chatBindings, hooks, chatId);
+          return toolResult(output, {output});
         } catch (error) {
           toolCallNotes.set(toolCallId, {
             error: toolErrorText(error)

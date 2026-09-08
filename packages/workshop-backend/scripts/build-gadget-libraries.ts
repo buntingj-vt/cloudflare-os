@@ -56,9 +56,11 @@ const EXTERNALS: Record<LibrarySide, string[]> = {
  * \`gadgets:editor/server\`, a bare \`gadgets:sync/server\` would be looked up as
  * \`gadgets:editor/gadgets:sync/server\`. The bundle therefore climbs out of its "directory" first,
  * and \`../gadgets:sync/server\` lands on the module the loader registered under the plain specifier
- * (see src/gadget-library-resolution.ts). A gadget's own \`server.js\` has no directory, which is why
- * its bare import needs no such prefix. The client bundle is untouched: the iframe resolves the bare
- * specifier through its import map.
+ * (see src/gadget-library-resolution.ts). A gadget's own \`server.js\` has no directory, so its bare
+ * import needs no such prefix; for the gadget's files under \`lib/\` and the like, the loader adds
+ * shims (\`lib/gadgets:sync/server\` re-exporting the root module the same way, one \`../\` deeper)
+ * rather than asking the gadget to spell the prefix. The client bundle is untouched: the iframe resolves the
+ * bare specifier through its import map.
  */
 const SERVER_LIBRARY_IMPORTS: Plugin = {
   name: "server-library-imports",
@@ -173,6 +175,13 @@ async function bundle(manifest: GadgetLibraryManifest, side: LibrarySide): Promi
     metafile: true,
   });
   if (!result.metafile) throw new Error(`${specifier}: esbuild produced no metafile`);
+  // The loader's nested-directory shims are `export *`, which forwards no default export (see
+  // gadgetWorkerModules), so a default export would exist for `server.js` and vanish for
+  // `lib/impl.js`.
+  if (side === "server" &&
+      Object.values(result.metafile.outputs).some(output => output.exports.includes("default"))) {
+    throw new Error(`${specifier} has a default export; libraries export named bindings only`);
+  }
   const imports = Object.values(result.metafile.inputs).flatMap(input => input.imports);
   const dependencies = dependenciesOf(manifest, side, imports);
   for (const input of Object.keys(result.metafile.inputs)) {

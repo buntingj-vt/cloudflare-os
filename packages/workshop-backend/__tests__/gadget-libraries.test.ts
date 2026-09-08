@@ -76,6 +76,28 @@ const GADGET_FILES: Record<string, string> = {
   [GADGET_JSON_PATH]: formatPins(LATEST_PINS),
 };
 
+/**
+ * A gadget whose server side spans directories, each importing a library by its bare specifier: what
+ * agent-written JavaScript produces, and what the blueprint check accepts. The entrypoint reports
+ * whether the class reached through `lib/` is the one server.js imports directly.
+ */
+const NESTED_FILES: Record<string, string> = {
+  "client.js": GADGET_FILES["client.js"],
+  "server.js": 'import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";\n' +
+      'import { MutationQueue } from "gadgets:sync/server";\n' +
+      'import { Queue, viaDeep } from "./lib/impl.js";\n' +
+      "export class Gadget extends DurableObject {}\n" +
+      "export class ExportHandler extends WorkerEntrypoint {\n" +
+      "  sameBinding() { return [MutationQueue === Queue, viaDeep === MutationQueue]; }\n" +
+      "}\n",
+  "lib/impl.js": 'export { MutationQueue as Queue } from "gadgets:sync/server";\n' +
+      'export { viaDeep } from "./deep/more.js";\n',
+  "lib/deep/more.js": 'import { MutationQueue } from "gadgets:sync/server";\n' +
+      'import { clientOnly } from "gadgets:ui/server";\n' +
+      "export const viaDeep = clientOnly ? MutationQueue : null;\n",
+  [GADGET_JSON_PATH]: formatPins(LATEST_PINS),
+};
+
 /** A gadget whose server.js is one re-export line over a library. */
 const REEXPORT_FILES: Record<string, string> = {
   "client.js": 'import "gadgets:ui/client";\n',
@@ -268,6 +290,36 @@ describe("gadgetWorkerModules", () => {
         "ExportHandler");
     expect(await handler.getExportFormats()).toEqual([expect.objectContaining({ id: "flag", label: "true" })]);
     expect(worker.getDurableObjectClass("Gadget")).toBeDefined();
+  });
+
+  it("registers no shims for a flat gadget, and one per directory and library for a nested one", () => {
+    let flat = gadgetWorkerModules(files(GADGET_FILES)).modules;
+    expect(Object.keys(flat).filter(name => name.includes("/gadgets:"))).toEqual([]);
+
+    let { modules } = gadgetWorkerModules(files(NESTED_FILES));
+    expect(Object.keys(modules).filter(name => name.includes("/gadgets:")).toSorted()).toEqual(
+        ["lib", "lib/deep"].flatMap(directory =>
+            shippedModules("server").map(library => `${directory}/${library.specifier}`)).toSorted());
+    // One `../` per slash in the shim's own name: workerd takes `lib/gadgets:sync/` as its directory.
+    expect(modules["lib/gadgets:sync/server"]).toEqual({ js: 'export * from "../../gadgets:sync/server";\n' });
+    expect(modules["lib/deep/gadgets:ui/server"])
+        .toEqual({ js: 'export * from "../../../gadgets:ui/server";\n' });
+  });
+
+  it("resolves a bare library import from a nested module to the one root instance", async () => {
+    // workerd resolves `gadgets:sync/server` in lib/impl.js as `lib/gadgets:sync/server`; without the
+    // shims the load fails with "No such module". The `../` climb is also what a library's own
+    // import of another library relies on (see scripts/build-gadget-libraries.ts).
+    let { modules } = gadgetWorkerModules(files(NESTED_FILES));
+    let worker = env.LOADER.get(`gadget-libraries-nested-${++doCounter}`, async () => ({
+      compatibilityDate: "2026-02-01",
+      compatibilityFlags: ["allow_irrevocable_stub_storage"],
+      mainModule: "server.js",
+      modules,
+      globalOutbound: null,
+    }));
+    let handler = worker.getEntrypoint<{ sameBinding(): Promise<boolean[]> }>("ExportHandler");
+    expect(await handler.sameBinding()).toEqual([true, true]);
   });
 });
 

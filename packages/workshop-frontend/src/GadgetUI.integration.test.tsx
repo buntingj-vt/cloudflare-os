@@ -125,6 +125,12 @@ class TestCallbacks extends RpcTarget implements TestSubscriber {
   }
 }
 
+// The same digest the host computes over the code it is handed (Web Crypto, hex).
+const sha256 = async (text: string) =>
+  Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))), (byte) =>
+    byte.toString(16).padStart(2, '0'),
+  ).join('')
+
 function fakeGadget(
   value: string,
   bundleCode: string,
@@ -132,12 +138,23 @@ function fakeGadget(
     async () => new RpcStub(new TestGadgetTarget(value)) as unknown as RpcStub<TestGadget>,
   ),
 ) {
-  const getUiBundle = vi.fn<() => Promise<UiBundle>>(async () => ({ jsCode: bundleCode }))
+  const getUiBundle = vi.fn<() => Promise<UiBundle | null>>(async () => ({ jsCode: bundleCode }))
+  const getLibraryCode = vi.fn<(specifier: string) => Promise<string>>()
   return {
     connectToGadget,
     getUiBundle,
-    stub: { connectToGadget, getUiBundle } as unknown as RpcStub<GadgetClient>,
+    getLibraryCode,
+    stub: { connectToGadget, getUiBundle, getLibraryCode } as unknown as RpcStub<GadgetClient>,
   }
+}
+
+// Points `gadget`'s bundle at one library module, `code`, under the hash the host will check it by.
+async function serveLibrary(gadget: ReturnType<typeof fakeGadget>, jsCode: string, code: string) {
+  const hash = await sha256(code)
+  gadget.getUiBundle.mockImplementation(async () => ({
+    jsCode, libraries: [{ specifier: 'gadgets:demo/client', hash }],
+  }))
+  gadget.getLibraryCode.mockImplementation(async () => code)
 }
 
 function deferred<T>() {
@@ -157,6 +174,23 @@ function dispatchIframeHandshake(iframe: HTMLIFrameElement, port: MessagePort) {
     source: iframe.contentWindow,
     ports: [port],
   }))
+}
+
+function importMapOf(srcdoc: string): Record<string, string> {
+  const match = /<script type="importmap">(.*?)<\/script>/s.exec(srcdoc)
+  if (!match) throw new Error('no import map in srcdoc')
+  return JSON.parse(match[1]).imports
+}
+
+function bannerText(container: HTMLElement): string {
+  return container.querySelector('[data-testid="banner"]')?.textContent ?? ''
+}
+
+function decodeDataModule(url: string): string {
+  const prefix = 'data:text/javascript;base64,'
+  expect(url.startsWith(prefix)).toBe(true)
+  const bytes = Uint8Array.from(atob(url.slice(prefix.length)), c => c.charCodeAt(0))
+  return new TextDecoder().decode(bytes)
 }
 
 describe('GadgetUI RPC recovery', () => {
@@ -208,18 +242,94 @@ describe('GadgetUI RPC recovery', () => {
     await expect(firstChild.read()).resolves.toBe('first')
     await expect((firstChild as any).child().read()).resolves.toBe('first')
 
-    const replacement = fakeGadget(
-      'replacement',
-      'document.body.textContent = "replacement"',
-    )
+    const replacement = fakeGadget('replacement', 'document.body.textContent = "first"')
     await act(async () => {
       root.render(<GadgetUI gadget={replacement.stub} height="100px" />)
     })
 
     await vi.waitFor(() => expect(replacement.connectToGadget).toHaveBeenCalledOnce())
+    // The reconnect asks the replacement what it serves, and finding the same bundle keeps the iframe.
+    await vi.waitFor(() => expect(replacement.getUiBundle).toHaveBeenCalledOnce())
+    await act(async () => { await Promise.resolve() })
     expect(container.querySelector('iframe')).toBe(firstIframe)
     await expect(firstChild.read()).resolves.toBe('replacement')
     await expect((firstChild as any).child().read()).resolves.toBe('replacement')
+  })
+
+  it('reloads the iframe when the replacement gadget client serves different code', async () => {
+    const first = fakeGadget('first', 'document.body.textContent = "first"')
+    await act(async () => {
+      root.render(<GadgetUI gadget={first.stub} height="100px" />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    const firstIframe = container.querySelector('iframe')!
+    const firstChild = connectIframe(firstIframe)
+    await expect(firstChild.read()).resolves.toBe('first')
+
+    // A collaborator merged new code into the gadget, or a deploy changed the server it runs on,
+    // and the socket dropped: the iframe still runs the old client.js.
+    const replacement = fakeGadget('replacement', 'document.body.textContent = "merged"')
+    await act(async () => {
+      root.render(<GadgetUI gadget={replacement.stub} height="100px" />)
+    })
+
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBe(firstIframe))
+    expect(container.querySelector('iframe')!.srcdoc).toContain('merged')
+    expect(container.querySelector('iframe')!.srcdoc).not.toContain('"first"')
+    const reloadedChild = connectIframe(container.querySelector('iframe')!)
+    await expect(reloadedChild.read()).resolves.toBe('replacement')
+  })
+
+  it('reloads the iframe when only a library the code imports changed', async () => {
+    const jsCode = 'import { greeting } from "gadgets:demo/client"; document.body.textContent = greeting'
+    const first = fakeGadget('first', jsCode)
+    await serveLibrary(first, jsCode, 'export const greeting = "reconnect v1"')
+    await act(async () => {
+      root.render(<GadgetUI gadget={first.stub} height="100px" />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    const firstIframe = container.querySelector('iframe')!
+    expect(decodeDataModule(importMapOf(firstIframe.srcdoc)['gadgets:demo/client'])).toContain('v1')
+    connectIframe(firstIframe)
+
+    // A deploy shipped a new `latest` library. The gadget's own code is unchanged, so nothing but
+    // the hash in the bundle's refs says so.
+    const replacement = fakeGadget('replacement', jsCode)
+    await serveLibrary(replacement, jsCode, 'export const greeting = "reconnect v2"')
+    await act(async () => {
+      root.render(<GadgetUI gadget={replacement.stub} height="100px" />)
+    })
+
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBe(firstIframe))
+    expect(decodeDataModule(importMapOf(container.querySelector('iframe')!.srcdoc)['gadgets:demo/client']))
+        .toContain('v2')
+  })
+
+  it('keeps the redirected iframe when the replacement cannot say what bundle it serves', async () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const first = fakeGadget('first', 'document.body.textContent = "first"')
+      await act(async () => {
+        root.render(<GadgetUI gadget={first.stub} height="100px" />)
+      })
+      await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+      const firstIframe = container.querySelector('iframe')!
+      const firstChild = connectIframe(firstIframe)
+      await expect(firstChild.read()).resolves.toBe('first')
+
+      const replacement = fakeGadget('replacement', 'unused')
+      replacement.getUiBundle.mockRejectedValue(new Error('metadata unavailable'))
+      await act(async () => {
+        root.render(<GadgetUI gadget={replacement.stub} height="100px" />)
+      })
+
+      await vi.waitFor(() => expect(consoleWarn).toHaveBeenCalledOnce())
+      await act(async () => { await Promise.resolve() })
+      expect(container.querySelector('iframe')).toBe(firstIframe)
+      await expect(firstChild.read()).resolves.toBe('replacement')
+    } finally {
+      consoleWarn.mockRestore()
+    }
   })
 
   it('queues calls while the replacement connection is pending', async () => {
@@ -235,7 +345,7 @@ describe('GadgetUI RPC recovery', () => {
     const connection = deferred<RpcStub<TestGadget>>()
     const replacement = fakeGadget(
       'replacement',
-      'document.body.textContent = "replacement"',
+      'document.body.textContent = "first"',
       vi.fn(() => connection.promise),
     )
     await act(async () => {
@@ -304,11 +414,13 @@ describe('GadgetUI RPC recovery', () => {
     await subscribe()
     expect(values).toEqual(['first'])
 
-    const replacement = fakeGadget('replacement', 'unused')
+    const replacement = fakeGadget('replacement', 'document.body.textContent = "first"')
     await act(async () => {
       root.render(<GadgetUI gadget={replacement.stub} height="100px" />)
     })
     await vi.waitFor(() => expect(values).toEqual(['first', 'replacement']))
+    await vi.waitFor(() => expect(replacement.getUiBundle).toHaveBeenCalledOnce())
+    await act(async () => { await Promise.resolve() })
     expect(container.querySelector('iframe')).toBe(iframe)
 
     callbacks!.closed = true
@@ -364,7 +476,7 @@ describe('GadgetUI RPC recovery', () => {
     await act(async () => root.render(<GadgetUI gadget={stale.stub} height="100px" />))
     await vi.waitFor(() => expect(stale.connectToGadget).toHaveBeenCalledOnce())
 
-    const current = fakeGadget('current', 'unused')
+    const current = fakeGadget('current', 'document.body.textContent = "first"')
     await act(async () => root.render(<GadgetUI gadget={current.stub} height="100px" />))
     await vi.waitFor(() => expect(current.connectToGadget).toHaveBeenCalledOnce())
     await expect(child.read()).resolves.toBe('current')
@@ -510,23 +622,6 @@ describe('GadgetUI RPC recovery', () => {
   })
 })
 
-function importMapOf(srcdoc: string): Record<string, string> {
-  const match = /<script type="importmap">(.*?)<\/script>/s.exec(srcdoc)
-  if (!match) throw new Error('no import map in srcdoc')
-  return JSON.parse(match[1]).imports
-}
-
-function bannerText(container: HTMLElement): string {
-  return container.querySelector('[data-testid="banner"]')?.textContent ?? ''
-}
-
-function decodeDataModule(url: string): string {
-  const prefix = 'data:text/javascript;base64,'
-  expect(url.startsWith(prefix)).toBe(true)
-  const bytes = Uint8Array.from(atob(url.slice(prefix.length)), c => c.charCodeAt(0))
-  return new TextDecoder().decode(bytes)
-}
-
 describe('GadgetUI library import map', () => {
   let container: HTMLDivElement
   let root: Root
@@ -546,11 +641,6 @@ describe('GadgetUI library import map', () => {
   // tag makes each test's module distinct, since the cache is keyed by the module's real hash and
   // lives for the whole test file.
   const libraryCode = (tag: string) => `export const greeting = "héllo — 你好 ${tag}"`
-  // The same digest the host computes over the code it is handed (Web Crypto, hex).
-  const sha256 = async (text: string) =>
-    Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))), (byte) =>
-      byte.toString(16).padStart(2, '0'),
-    ).join('')
 
   function libraryGadget(
     tag: string,

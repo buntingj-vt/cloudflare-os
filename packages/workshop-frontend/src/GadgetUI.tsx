@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { Text, Loader, Banner } from '@cloudflare/kumo'
 import { Sparkle } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
-import { GadgetClient, ConsoleLogEvent, GadgetLibraryRef } from '@gadgets/workshop-shared/api'
+import { GadgetClient, ConsoleLogEvent, GadgetLibraryRef, UiBundle } from '@gadgets/workshop-shared/api'
 import { base64Utf8 } from './utils/base64'
 
 // We want to inject Cap'n Web into the Gadget. Luckily it has no dependencies, so we can just take
@@ -176,6 +176,28 @@ const createImportMap = (libraries: ReadonlyMap<string, string>): string => {
   return `<script type="importmap">${json}</script>\n    `
 }
 
+// What the iframe was built from, kept so a reconnect can tell whether the server it now talks to
+// serves the same bundle. Libraries are compared by hash in order, since `latest` pins move without
+// any change to the gadget's own code.
+interface LoadedBundle {
+  jsCode: string
+  libraries: readonly GadgetLibraryRef[]
+}
+
+const loadedBundleOf = (bundle: UiBundle | null): LoadedBundle | null =>
+  bundle && {
+    jsCode: bundle.jsCode,
+    libraries: (bundle.libraries ?? []).map(({ specifier, hash }) => ({ specifier, hash })),
+  }
+
+const sameBundle = (loaded: LoadedBundle | null, current: LoadedBundle | null): boolean => {
+  if (loaded === null || current === null) return loaded === current
+  return loaded.jsCode === current.jsCode &&
+    loaded.libraries.length === current.libraries.length &&
+    loaded.libraries.every((ref, index) =>
+      ref.specifier === current.libraries[index].specifier && ref.hash === current.libraries[index].hash)
+}
+
 const createSandboxedHtml = (jsCode: string, libraries: ReadonlyMap<string, string>): string => {
   return `<!DOCTYPE html>
 <html>
@@ -215,6 +237,11 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
   const [isInvalidated, setIsInvalidated] = useState(false)
   const [iframeGeneration, setIframeGeneration] = useState(0)
   const iframeRef = useRef<HTMLIFrameElement>(null)
+  // The bundle the current iframe runs (see LoadedBundle), read by the reconnect effect, which must
+  // not re-run when a load completes.
+  const loadedBundleRef = useRef<LoadedBundle | null>(null)
+  const hasLoadedRef = useRef(false)
+  hasLoadedRef.current = hasLoaded
   const prevReloadTriggerRef = useRef(reloadTrigger)
   // Identifies the newest bundle load, so an older one can't write state after being superseded.
   const loadGenerationRef = useRef(0)
@@ -291,6 +318,24 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
       if (!isCurrent()) stub[Symbol.dispose]?.()
     }, () => {})
 
+    // The iframe is kept across a reconnect, so it may now run code the server no longer serves: a
+    // deploy changes a `latest` library with no commit to the gadget, and a collaborator's merge
+    // changes the gadget's own code with no `reloadTrigger` for this client. The reconnect is the
+    // only signal either has, so the bundle is compared to what the iframe was built from, and a
+    // difference invalidates the view, which the load effect rebuilds and the loading state
+    // replaces the iframe for. A transient failure to ask is not a reason to reload.
+    const reloadIfBundleChanged = async () => {
+      let bundle: UiBundle | null
+      try {
+        bundle = await gadget.getUiBundle(chatId)
+      } catch (caught) {
+        if (isCurrent()) console.warn('Could not check the gadget UI bundle after reconnecting:', caught)
+        return
+      }
+      if (!isCurrent() || sameBundle(loadedBundleRef.current, loadedBundleOf(bundle))) return
+      setIsInvalidated(true)
+    }
+
     const reconnect = async () => {
       let timeout: ReturnType<typeof setTimeout> | undefined
       try {
@@ -308,9 +353,11 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         oldStub?.[Symbol.dispose]?.()
       } catch (caught) {
         if (isCurrent()) reloadIframe(caught)
+        return
       } finally {
         if (timeout !== undefined) clearTimeout(timeout)
       }
+      if (hasLoadedRef.current) await reloadIfBundleChanged()
     }
     void reconnect()
   }, [gadget, chatId])
@@ -371,6 +418,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         } else {
           setSandboxedHtml(null)
         }
+        loadedBundleRef.current = loadedBundleOf(bundle)
         setHasLoaded(true)
         setIsInvalidated(false)
       } catch (err) {

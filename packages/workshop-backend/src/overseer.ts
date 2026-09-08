@@ -6809,13 +6809,14 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Describe a workpiece -- a gadget or a gatekeeper -- reachable as `envName` in a chat's env,
-  // for the agent's describeBinding tool.
-  async describeBinding(envName: string, id: WorkpieceId): Promise<string> {
+  // for the agent's describeBinding tool. The tool records the text, so a later call may say
+  // something else; replay of logs from before it was recorded recomputes it, which the worktree
+  // branch keeps stable by reading only immutable record fields (title, baseCommit -- never the
+  // mutable head). A gadget is described as `chatId` sees its files (see readGadgetFiles): omitted,
+  // by tests and by nothing else, it is described from mainline.
+  async describeBinding(envName: string, id: WorkpieceId, chatId?: number): Promise<string> {
     let gadget = this.storage.gadgets.get(id);
     if (gadget?.type === "worktree") {
-      // Only immutable record fields here (title, baseCommit -- never the mutable head):
-      // replayed describeBinding tool calls recompute this text, so it must not drift between
-      // the live call and its replay.
       return `Binding: ${envName}\n` +
           `\n` +
           `This binding is a worktree titled ${JSON.stringify(gadget.title)}: a file tree ` +
@@ -6834,7 +6835,7 @@ class OverseerImpl implements AgentHooks {
           `This binding is an RPC stub that points at the main Durable Object instance of the ` +
           `Gadget ${JSON.stringify(gadget.title)}. Calling a method on the stub invokes the ` +
           `same-named method on the class exported by the Gadget's server.js` +
-          (await this.#describeGadgetLibraryImports(gadget.id) ??
+          (await this.#describeGadgetLibraryImports(gadget.id, chatId) ??
               ` (read that file to learn the API it offers).`);
     }
     let gatekeeper = this.storage.gatekeepers.get(id);
@@ -6845,17 +6846,16 @@ class OverseerImpl implements AgentHooks {
   }
 
   /**
-   * How describeBinding ends for a gadget whose committed server.js gets its class from a library,
-   * or undefined for one that does not: such a server.js may be one re-export line, so reading it
-   * teaches the agent nothing, and the interface is in the library's declarations, which
+   * How describeBinding ends for a gadget whose server.js, as the chat sees it, gets its class from
+   * a library, or undefined for one that does not: such a server.js may be one re-export line, so
+   * reading it teaches the agent nothing, and the interface is in the library's declarations, which
    * `describeGadgetLibrary` shows. Read from the pins and the import text alone -- never from the
-   * library shipped today -- so the text changes only when the gadget's own code does, like the
-   * file it would otherwise point the agent at.
+   * library shipped today -- so the text describes the gadget's own code, like the file it would
+   * otherwise point the agent at.
    */
-  async #describeGadgetLibraryImports(gadgetId: WorkpieceId): Promise<string | undefined> {
-    let head = this.getGadgetHead(gadgetId);
-    if (head === undefined) return undefined;
-    let files = await this.gitStore.readCommitFiles(head);
+  async #describeGadgetLibraryImports(gadgetId: WorkpieceId, chatId?: number)
+      : Promise<string | undefined> {
+    let files = await this.readGadgetFiles(gadgetId, chatId);
     let pins = readPins(files);
     let serverJs = files.get("server.js") ?? "";
     let imported = libraryImportsIn(serverJs, "server").filter(name => pins.has(name));
