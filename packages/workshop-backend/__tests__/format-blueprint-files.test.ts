@@ -539,7 +539,6 @@ describe("format blueprint library pins", () => {
 
   it.each([
     ["not JSON", "{libraries: {}}", /gadget\.json: not valid JSON \(/u],
-    ["an array", "[]", "gadget.json: must be an object"],
     ["an unknown key", '{"libraries": {"page": "latest"}, "version": 1}',
       "gadget.json: unknown keys: version"],
     ["a libraries list", '{"libraries": ["page"]}',
@@ -557,6 +556,29 @@ describe("format blueprint library pins", () => {
     await expect(readSourceFiles(directory, "example/files")).rejects.toThrow(message);
     await expect(readSourceFiles(directory, "example/files")).rejects.toThrow(/^example\/files: /u);
   });
+
+  // gadget.json was an unrestricted filename before pins existed, so one that is not a pin file
+  // (no `libraries` key) is left alone -- and then pins nothing, so a library import fails as
+  // unpinned rather than the file failing to parse.
+  it.each(["[]", '{"version": 1}', '"page"'])(
+    "reads no pins from a gadget.json of %s, which is not a pin file", async text => {
+      let plain = await sourceTree({
+        "client.js": "// no libraries\n",
+        "gadget.json": text,
+      });
+      expect(await readSourceFiles(plain, "example/files")).toEqual(new Map([
+        ["client.js", "// no libraries\n"],
+        ["gadget.json", text],
+      ]));
+
+      let importing = await sourceTree({
+        "client.js": 'import { mount } from "gadgets:page/client";\nmount();\n',
+        "gadget.json": text,
+      });
+      await expect(readSourceFiles(importing, "example/files")).rejects
+        .toThrow("example/files: client.js imports gadgets:page/client, which gadget.json does " +
+            "not pin");
+    });
 
   it.each(["gadgets:page", "gadgets:page/lib", "gadgets:page/client/index.js",
     "gadgets:Page/client", "gadgets:/client"])(
@@ -615,6 +637,42 @@ describe("format blueprint library pins", () => {
       await expect(readSourceFiles(directory, "example/files")).rejects
         .toThrow("client.js imports gadgets:page/server from the client side");
     });
+
+    // esbuild leaves a URL import in the bundle as an external without complaint, so the bundle's
+    // surviving imports are checked against what the entry's runtime supplies.
+    it("rejects an import the runtime does not supply, and keeps the ones it does", async () => {
+      let url = await sourceTree({
+        "client.ts": [
+          'import x from "https://example.com/x.js";',
+          'import { mount } from "gadgets:page/client";',
+          "mount(x);",
+        ].join("\n"),
+        "gadget.json": PAGE_PINS,
+      });
+      await expect(readSourceFiles(url, "example/files")).rejects
+        .toThrow("example/files: client.ts imports https://example.com/x.js, which the client " +
+            "runtime does not supply");
+
+      // workerd's own modules are the server's externals only; on the client esbuild has nothing
+      // to resolve them against, so that one fails as an ordinary unresolved import.
+      let cloudflare = await sourceTree({
+        "client.ts": 'import { DurableObject } from "cloudflare:workers";\nconsole.log(DurableObject);',
+      });
+      await expect(readSourceFiles(cloudflare, "example/files")).rejects
+        .toThrow(/client\.ts failed to bundle: .*Could not resolve "cloudflare:workers"/su);
+
+      let supplied = await sourceTree({
+        "server.ts": [
+          'import { DurableObject } from "cloudflare:workers";',
+          'import { Gadget as Base } from "gadgets:page/server";',
+          "export class Gadget extends Base { static base = DurableObject; }",
+        ].join("\n"),
+        "gadget.json": PAGE_PINS,
+      });
+      let files = await readSourceFiles(supplied, "example/files");
+      expect(files.get("server.js")).toMatch(/from "cloudflare:workers";/u);
+      expect(files.get("server.js")).toMatch(/from "gadgets:page\/server";/u);
+    });
   });
 });
 
@@ -639,6 +697,13 @@ describe("gadget library grammar", () => {
     expect(parsePins('{"libraries": {}}')).toEqual(new Map());
   });
 
+  // The filename predates pins, so a gadget.json without a `libraries` key is somebody else's
+  // file: no pins, and none of the pin file's rules.
+  it.each(["null", '"page"', "[]", "1", '{"pins": {}}', '{"version": 1, "name": "x"}'])(
+    "reads no pins from %s, which is not a pin file", text => {
+      expect(parsePins(text)).toEqual(new Map());
+    });
+
   it("reads pins through the file map", () => {
     expect(readPins(new Map([["gadget.json", '{"libraries": {"page": "latest"}}']])))
       .toEqual(new Map([["page", "latest"]]));
@@ -662,10 +727,7 @@ describe("gadget library grammar", () => {
 
   it.each([
     ["{libraries: {}}", /^gadget\.json: not valid JSON \(/u],
-    ["null", "gadget.json: must be an object"],
-    ['"page"', "gadget.json: must be an object"],
-    ["[]", "gadget.json: must be an object"],
-    ['{"pins": {}}', "gadget.json: unknown keys: pins"],
+    ['{"libraries": {}, "pins": {}}', "gadget.json: unknown keys: pins"],
     ['{"libraries": null}', "gadget.json: libraries must be an object of library name to pin"],
     ['{"libraries": "page"}', "gadget.json: libraries must be an object of library name to pin"],
     ['{"libraries": {"page": "Latest"}}', 'gadget.json: libraries.page must be "latest"'],

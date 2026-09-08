@@ -10,7 +10,7 @@ import {
 } from "../src/gadget-libraries.js";
 import { describeGadgetLibrary } from "../src/agent.js";
 import {
-  LIBRARIES_FINGERPRINT, gadgetWorkerModules, resolveLibraries,
+  LIBRARIES_FINGERPRINT, blueprintFilesFromCode, gadgetWorkerModules, resolveLibraries,
 } from "../src/gadget-library-resolution.js";
 import { FORMAT_BLUEPRINTS } from "../src/generated/format-blueprints.js";
 import { type BundledGadgetLibrary, GADGET_LIBRARIES } from "../src/generated/gadget-libraries.js";
@@ -268,6 +268,39 @@ describe("gadgetWorkerModules", () => {
         "ExportHandler");
     expect(await handler.getExportFormats()).toEqual([expect.objectContaining({ id: "flag", label: "true" })]);
     expect(worker.getDurableObjectClass("Gadget")).toBeDefined();
+  });
+});
+
+describe("blueprintFilesFromCode", () => {
+  it("decodes an archive whose pins the deployment honours", () => {
+    expect(blueprintFilesFromCode(archiveOf(GADGET_FILES))).toEqual(files(GADGET_FILES));
+    expect(blueprintFilesFromCode(archiveOf({ "client.js": "// plain\n" })))
+        .toEqual(files({ "client.js": "// plain\n" }));
+  });
+
+  it("refuses an empty archive", () => {
+    expect(() => blueprintFilesFromCode(archiveOf({}))).toThrow(/code archive is empty/);
+  });
+
+  it("refuses a pin the deployment does not bundle, on either side", () => {
+    expect(() => blueprintFilesFromCode(archiveOf({
+      ...GADGET_FILES, [GADGET_JSON_PATH]: formatPins(new Map([["nope", "latest"]])),
+    }))).toThrow(/no library named nope/);
+    expect(() => blueprintFilesFromCode(archiveOf({ "server.js": "export class Gadget {}\n", [GADGET_JSON_PATH]: "{" })))
+        .toThrow(/gadget\.json: not valid JSON/);
+  });
+
+  it("refuses a pin whose bundled dependency is unpinned", () => {
+    // Same stand-in as resolveLibraries' own case: no shipped library imports another today.
+    let withDependency = GADGET_LIBRARIES.find(library => library.dependencies.length > 0);
+    if (!withDependency) {
+      expect(blueprintFilesFromCode(archiveOf(REEXPORT_FILES))).toEqual(files(REEXPORT_FILES));
+      return;
+    }
+    let [dependency] = withDependency.dependencies;
+    expect(() => blueprintFilesFromCode(archiveOf({
+      ...GADGET_FILES, [GADGET_JSON_PATH]: formatPins(new Map([[withDependency!.name, "latest"]])),
+    }))).toThrow(`pin ${dependency} too.`);
   });
 });
 

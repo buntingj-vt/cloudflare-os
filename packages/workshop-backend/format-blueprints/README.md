@@ -147,6 +147,12 @@ The named directory replaces this set rather than extending it. It can be empty 
 formats. The import command honors the same variable. Keeping deployment-owned formats outside this
 repo avoids modifying it when it is consumed as a submodule.
 
+A `FORMAT_BLUEPRINTS_DIR` tree may be written in TypeScript like the blueprints here, and the build
+bundles it the same way: a syntax error or an import that does not resolve fails the build. It is
+not type-checked, though. The repo's `tsconfig.blueprints-*.json` programs are static and cover only
+`format-blueprints/`, so a tree elsewhere needs its own `tsc` run in the repository that owns it, or
+can stay JavaScript.
+
 Directories using the previous `<name>.gadget` plus `<name>.json` layout remain supported, so an
 existing deployment can update this repo without coordinating a format conversion. Importing a new
 export into one of those entries migrates that pair to the extracted layout automatically.

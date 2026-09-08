@@ -275,7 +275,10 @@ const JAVASCRIPT_EXTENSION = /\.js$/u;
  *
  * Bundles are readable rather than minified, because the agent edits the installed file. The only
  * imports that survive are the ones the entry's runtime supplies (see {@link ENTRY_POINTS}); every
- * other specifier has to resolve to a file the blueprint owns.
+ * other specifier has to resolve to a file the blueprint owns. esbuild enforces that for bare
+ * specifiers, which it resolves or fails on, but not for URLs: `import x from "https://..."` is
+ * left in the output as an external without a word, so the bundle's surviving imports are checked
+ * against the entry's allowlist here.
  *
  * Rejected, rather than silently mis-shipped: an entry present as both `x.ts` and `x.js`; a `.ts`
  * file that is neither an entry nor under `lib/`; a TypeScript dialect the archive has no place for
@@ -356,6 +359,14 @@ async function bundleTypeScriptSources(
         invalid(label, `${entry.name}.ts imports ${input}, which is outside the blueprint's files`);
       }
     }
+    for (const bundle of Object.values(metafile.outputs)) {
+      for (const imported of bundle.imports) {
+        if (imported.external && !matchesExternal(imported.path, entry.external)) {
+          invalid(label, `${entry.name}.ts imports ${imported.path}, which the ${entry.name} ` +
+              `runtime does not supply`);
+        }
+      }
+    }
     output.set(`${entry.name}.js`, text);
   }));
   // What esbuild inlined cannot say whether every `lib/` module is wanted: types are erased
@@ -366,6 +377,17 @@ async function bundleTypeScriptSources(
     if (!imported.has(lib)) invalid(label, `${lib} is not imported by any entry point`);
   }
   return new Map([...output].toSorted(([a], [b]) => compareNames(a, b)));
+}
+
+/**
+ * Whether `specifier` is one of the `external` patterns of an entry point: the pattern itself, or
+ * anything under a pattern ending in `*` -- the only wildcard {@link ENTRY_POINTS} uses, and the
+ * shape esbuild's own `external` matching gives it.
+ */
+function matchesExternal(specifier: string, patterns: readonly string[]): boolean {
+  return patterns.some(pattern => pattern.endsWith("*")
+      ? specifier.startsWith(pattern.slice(0, -1))
+      : specifier === pattern);
 }
 
 /**
@@ -381,7 +403,7 @@ async function bundleTypeScriptSources(
  * {@link importedModules} makes, so an unpinned specifier in a comment fails the build too; the fix
  * is the pin or the comment.
  */
-function checkLibraryPins(
+export function checkLibraryPins(
   files: ReadonlyMap<string, string>,
   label: string,
   libraries: ReadonlyMap<string, readonly string[]> | undefined,

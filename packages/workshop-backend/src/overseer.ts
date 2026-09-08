@@ -61,9 +61,10 @@ import {
   validateChatAttachmentUpload,
 } from "./chat-attachment-validation";
 import { renderGadgetInBrowser } from "./browser-export";
-import { LIBRARY_SIDES, libraryImportsIn, parseLibrarySpecifier, readPins } from "./gadget-libraries";
+import { libraryImportsIn, parseLibrarySpecifier, readPins } from "./gadget-libraries";
 import {
-  LIBRARIES_FINGERPRINT, type ResolvedLibrary, gadgetWorkerModules, resolveLibraries,
+  LIBRARIES_FINGERPRINT, type ResolvedLibrary, blueprintFilesFromCode, gadgetWorkerModules,
+  resolveLibraries,
 } from "./gadget-library-resolution";
 import {
   defaultExportFormats,
@@ -9022,13 +9023,12 @@ class OverseerImpl implements AgentHooks {
           `instantiated.`);
     }
 
-    // Decode the snapshot. Archives always use the doc's unnamed root "" (see snapshotCode).
-    let archiveDoc = new Y.Doc();
-    Y.applyUpdateV2(archiveDoc, code);
+    // Decode the snapshot and check its pins resolve here, the same way initializeFromBlueprint
+    // does, so the tool reports the failure rather than success for a gadget that cannot load.
     // Null prototype so a hostile filename like "__proto__" is an ordinary key.
     let files: Record<string, string> = Object.create(null);
-    for (let [file, content] of archiveDoc.getMap<Y.Text>()) {
-      files[file] = content.toString();
+    for (let [file, content] of blueprintFilesFromCode(code)) {
+      files[file] = content;
     }
 
     // Apply the deployment's overrides, so a gadget the agent builds is labelled the same as one
@@ -9044,10 +9044,8 @@ class OverseerImpl implements AgentHooks {
     }
 
     let filenames = Object.keys(files);
-    lines.push("", filenames.length > 0
-        ? `Files copied into the new gadget: ${filenames.join(", ")}. Use readFile to inspect ` +
-          `them before editing.`
-        : `The blueprint contained no files, so the new gadget is empty.`);
+    lines.push("", `Files copied into the new gadget: ${filenames.join(", ")}. Use readFile to ` +
+        `inspect them before editing.`);
 
     let bindings = Object.entries(kvRecord.metadata.bindings);
     if (bindings.length === 0) {
@@ -10117,26 +10115,11 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     // Decode the archive and write the gadget's initial (parentless) commit *before* creating
     // the gadget record: every permanent gadget is born with a head (see GadgetRecord.commitId),
-    // so a failure here -- an empty archive, an unreachable owner -- must not leave a headless
-    // record behind. The commit is content-addressed and referenced by nothing until the record
-    // lands, so writing it first is safe. Archives always use the doc's unnamed root "" (see
-    // snapshotCode); the file contents transfer as plain text, becoming the gadget's first
-    // committed tree. An empty archive is refused rather than instantiated as a code-less
-    // gadget: blueprints of such gadgets cannot be created (see createBlueprint), so one can
-    // only arrive corrupted or hand-crafted.
-    let archiveDoc = new Y.Doc();
-    Y.applyUpdateV2(archiveDoc, code);
-    let files = new Map<string, string>();
-    for (let [file, content] of archiveDoc.getMap<Y.Text>()) {
-      files.set(file, content.toString());
-    }
-    if (files.size === 0) {
-      throw new Error("This blueprint's code archive is empty.");
-    }
-    // A pin the deployment cannot honour fails the instantiation rather than yielding a workspace
-    // whose gadget cannot load.
-    let pins = readPins(files);
-    for (let side of LIBRARY_SIDES) resolveLibraries(pins, side);
+    // so a failure here -- an empty archive, a pin this deployment cannot honour, an unreachable
+    // owner -- must not leave a headless record behind. The commit is content-addressed and
+    // referenced by nothing until the record lands, so writing it first is safe. The file contents
+    // transfer as plain text, becoming the gadget's first committed tree.
+    let files = blueprintFilesFromCode(code);
     let ownerId = this.impl.ownerId;
     if (!ownerId) {
       throw new Error("Workspace has no owner.");

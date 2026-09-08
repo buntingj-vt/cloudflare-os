@@ -19,8 +19,10 @@ import { readdir, readFile, writeFile, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadBundledLibraries } from "./bundled-gadget-libraries.ts";
 import {
   buildContent,
+  checkLibraryPins,
   extractFiles,
   findInterruptedImportBackups,
   parseArchive,
@@ -96,10 +98,8 @@ let sources = [
   ...legacyNames.map(name => ({name, kind: "legacy" as const})),
 ].toSorted((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
 validatePortablePaths(sources.map(source => source.name), sourceDir);
-// A blueprint may only pin a library this deployment bundles, and must pin what those import; the
-// generated module is what knows each library's imports, since they are found while bundling.
-let libraries = new Map((await import("../src/generated/gadget-libraries.ts")).GADGET_LIBRARIES
-    .map(library => [library.name, library.dependencies]));
+// A blueprint may only pin a library this deployment bundles, and must pin what those import.
+let libraries = await loadBundledLibraries();
 for (let source of sources) {
   let {name} = source;
   let raw: string;
@@ -132,9 +132,11 @@ for (let source of sources) {
   } else {
     raw = await readFile(join(sourceDir, `${name}.json`), "utf8");
     entry = parseFormatBlueprintPresentation(`${name}.json`, raw);
+    // The archive ships verbatim, but its pins are checked like an extracted blueprint's: a legacy
+    // entry can import a library too, and one this deployment does not bundle cannot load.
     bytes = await readFile(join(sourceDir, `${name}.gadget`));
     let archive = parseArchive(bytes, name);
-    extractFiles(archive.content, name);
+    checkLibraryPins(extractFiles(archive.content, name), name, libraries);
   }
 
   // Two archives installing under one id would race, and only one would survive.

@@ -67,8 +67,13 @@ export function libraryImportsIn(code: string, side: LibrarySide): string[] {
 
 /**
  * The pins a gadget's files declare: `gadget.json` parsed strictly, or no pins when the file is
- * absent. Throws on a file that is present but malformed -- an unparseable pin file must fail the
- * load loudly rather than run the gadget without the libraries it asked for.
+ * absent. Throws on a pin file that is malformed -- an unparseable pin file must fail the load
+ * loudly rather than run the gadget without the libraries it asked for.
+ *
+ * `gadget.json` was an unrestricted filename before libraries existed, so a gadget may carry one
+ * that is not about pins at all: a value that is not an object, or an object without a `libraries`
+ * key, is somebody else's file and declares no pins. Once `libraries` is present the file is a pin
+ * file and every rule applies: no other keys, an object of name to pin, valid names, `latest` pins.
  */
 export function readPins(files: ReadonlyMap<string, string>): GadgetPins {
   const text = files.get(GADGET_JSON_PATH);
@@ -86,10 +91,9 @@ export function parsePins(text: string): GadgetPins {
   } catch (err) {
     return bad(`not valid JSON (${err instanceof Error ? err.message : String(err)})`);
   }
-  if (!isRecord(parsed)) bad("must be an object");
-  const { libraries, ...rest } = parsed as Record<string, unknown>;
+  if (!isRecord(parsed) || !("libraries" in parsed)) return new Map();
+  const { libraries, ...rest } = parsed;
   if (Object.keys(rest).length > 0) bad(`unknown keys: ${Object.keys(rest).join(", ")}`);
-  if (libraries === undefined) return new Map();
   if (!isRecord(libraries)) bad("libraries must be an object of library name to pin");
   const pins = new Map<string, LibraryPin>();
   for (const [name, pin] of Object.entries(libraries as Record<string, unknown>)) {

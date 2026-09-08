@@ -5,9 +5,11 @@
  * depend on existing (they are what produces it).
  */
 
+import * as Y from "yjs";
 import {
   GADGET_JSON_PATH,
   type GadgetPins,
+  LIBRARY_SIDES,
   type LibrarySide,
   librarySpecifier,
   readPins,
@@ -81,4 +83,30 @@ export function gadgetWorkerModules(files: ReadonlyMap<string, string>)
   const libraries = resolveLibraries(readPins(files), "server");
   for (const {specifier, code} of libraries) modules[specifier] = {js: code};
   return {modules, libraries};
+}
+
+/**
+ * The files a blueprint's code archive holds, checked as the gadget they would become: the Yjs
+ * snapshot decoded (archives always use the doc's unnamed root "", see snapshotCode), an empty
+ * archive refused, and every pin resolved on both sides against what this deployment bundles.
+ *
+ * The one decode both instantiation paths go through -- the New menu's initializeFromBlueprint and
+ * the agent's createGadget -- so a blueprint whose pins this deployment cannot honour fails where it
+ * is instantiated, with the resolver's message, rather than yielding a gadget that cannot load. An
+ * empty archive is refused rather than instantiated as a code-less gadget: blueprints of such
+ * gadgets cannot be created (see createBlueprint), so one can only arrive corrupted or hand-crafted.
+ */
+export function blueprintFilesFromCode(code: Uint8Array): Map<string, string> {
+  const archiveDoc = new Y.Doc();
+  Y.applyUpdateV2(archiveDoc, code);
+  const files = new Map<string, string>();
+  for (const [file, content] of archiveDoc.getMap<Y.Text>()) {
+    files.set(file, content.toString());
+  }
+  if (files.size === 0) {
+    throw new Error("This blueprint's code archive is empty.");
+  }
+  const pins = readPins(files);
+  for (const side of LIBRARY_SIDES) resolveLibraries(pins, side);
+  return files;
 }

@@ -43,6 +43,11 @@ version: every workspace pinned that way runs the current library, the way a hos
 updates under its author. It is the only pin today; the pin file exists so that a copy a gadget
 carries in its own files can become a second value later without changing the grammar.
 
+The filename predates pins, so a `gadget.json` that is not an object or has no `libraries` key is
+treated as somebody else's file: it declares no pins and is not checked. Once `libraries` is
+present the file is a pin file, and every rule applies -- no other keys, an object of library name
+to pin, lowercase names, `latest` pins.
+
 The blueprint build (`scripts/format-blueprint-files.ts`) checks that a blueprint's imports and pins
 agree: every `gadgets:` import pinned, on the right side, naming a library that exists; every pin
 imported. The kernel reads the same file when it loads a gadget (`src/gadget-libraries.ts`), from
