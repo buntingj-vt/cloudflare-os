@@ -740,6 +740,17 @@ describe("Workspace Sheets document snapshots", () => {
   });
 });
 
+describe("Workspace Sheets cell formatting", () => {
+  it("keeps only string colours, dropping a value whose string form merely looks like one", async () => {
+    const fixture = inMemoryGadget();
+    const fmt = {c: ["#abc"], bg: "#123456", b: true, a: "c", fs: 12, x: true};
+    await fixture.applyOperation({senderId: "test", cellOps: [{sheetId: "sheet", ref: "A1", value: "v", fmt, baseVersion: 0}]});
+
+    const document = await fixture.getDocument();
+    expect(document.cells.sheet.A1.fmt).toEqual({bg: "#123456", b: true, a: "c", fs: 12});
+  });
+});
+
 describe("Workspace Sheets export formats", () => {
   it("reserves one of 32 slots for XLSX and applies the same CSV eligibility rules at export", async () => {
     const ids = Array.from({length: 40}, (_, index) => `sheet-${index}`);

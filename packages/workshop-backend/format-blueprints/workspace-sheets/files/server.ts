@@ -360,9 +360,9 @@ function sanitizeFmt(fmt: unknown): CellFmt | null {
   const out: CellFmt = {};
   for (const [k, v] of Object.entries(fmt as Record<string, unknown>)) {
     if (!isFmtKey(k) || v == null || v === false || v === "") continue;
-    // TODO(types): a non-string whose string form matches (e.g. `["#abc"]`) passes the test and
-    // is stored as-is, as it always was; the cast records that the check is on `String(v)`.
-    if (k === "c" || k === "bg") { if (/^#[0-9a-fA-F]{3,8}$/.test(String(v))) out[k] = v as string; }
+    // A colour is a string or nothing: `RegExp.test` would stringify an array like `["#abc"]` into
+    // a match and store the array itself.
+    if (k === "c" || k === "bg") { if (typeof v === "string" && /^#[0-9a-fA-F]{3,8}$/.test(v)) out[k] = v; }
     else if (k === "a") { if (v === "l" || v === "c" || v === "r") out[k] = v; }
     else if (k === "nf") { out[k] = String(v).slice(0, 20); }
     else if (k === "d") { const n = Math.round(Number(v)); if (n >= 0 && n <= 10) out[k] = n; }

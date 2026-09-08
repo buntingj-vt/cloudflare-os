@@ -2096,8 +2096,10 @@ function renderBlockActions(slide: Slide, block: Block): HTMLDivElement {
       copy.x = (copy.x ?? 0) + 24;
       copy.y = (copy.y ?? 0) + 24;
       const newId = await gadget.addBlock(slide.id, copy);
-      // TODO(types): addBlock returns null when the slide is gone; the client assumes it succeeded.
-      slide.blocks.push({ ...copy, id: newId! });
+      // null: the slide is gone -- deleted by another client, whose deck update has already
+      // replaced ours -- so there is nothing to add locally.
+      if (newId === null) return;
+      slide.blocks.push({ ...copy, id: newId });
       selectedBlockId = newId;
       render(); renderInspector();
     });
@@ -2726,8 +2728,10 @@ async function pasteClipboardBlock(): Promise<void> {
     copy.y = (copy.y ?? 0) + 24;
   }
   const newId = await gadget.addBlock(slide.id, copy);
-  // TODO(types): addBlock returns null when the slide is gone; the client assumes it succeeded.
-  slide.blocks.push({ ...copy, id: newId! });
+  // null: the slide is gone -- deleted by another client, whose deck update has already
+  // replaced ours -- so there is nothing to add locally.
+  if (newId === null) return;
+  slide.blocks.push({ ...copy, id: newId });
   selectedBlockId = newId;
   render(); renderInspector();
 }
@@ -2751,8 +2755,10 @@ async function duplicateSelectedBlock(): Promise<void> {
     copy.y = (copy.y ?? 0) + 24;
   }
   const newId = await gadget.addBlock(slide.id, copy);
-  // TODO(types): addBlock returns null when the slide is gone; the client assumes it succeeded.
-  slide.blocks.push({ ...copy, id: newId! });
+  // null: the slide is gone -- deleted by another client, whose deck update has already
+  // replaced ours -- so there is nothing to add locally.
+  if (newId === null) return;
+  slide.blocks.push({ ...copy, id: newId });
   selectedBlockId = newId;
   render(); renderInspector();
 }
@@ -2810,8 +2816,10 @@ async function addBlockOfType(type: string): Promise<void> {
   base.y = (base.y ?? 200) + sameType * 16;
   const block: BlockInput = { type, ...base };
   const id = await gadget.addBlock(slide.id, block);
-  // TODO(types): addBlock returns null when the slide is gone; the client assumes it succeeded.
-  block.id = id!;
+  // null: the slide is gone -- deleted by another client, whose deck update has already replaced
+  // ours -- so there is nothing to add locally.
+  if (id === null) return;
+  block.id = id;
   slide.blocks.push(block as Block);
   selectedBlockId = id;
   render(); renderInspector();

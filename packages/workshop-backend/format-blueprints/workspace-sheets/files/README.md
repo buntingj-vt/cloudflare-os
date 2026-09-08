@@ -173,7 +173,7 @@ broadcasts run outside the queue so a callback may re-enter it). The cell model,
 the grid, the sheet tabs and the exports are this gadget's own.
 
 In the repository the source is TypeScript under `format-blueprints/workspace-sheets/files/`
-(`client.ts`, `server.ts`, `lib/protocol.ts`, `lib/xlsx.ts`, `lib/zip.ts`), which the build bundles
+(`client.ts`, `server.ts`, `lib/protocol.ts`, `lib/formula.ts`, `lib/xlsx.ts`, `lib/zip.ts`), which the build bundles
 into the `client.js` and `server.js` shipped here.
 
 ### `client.js`

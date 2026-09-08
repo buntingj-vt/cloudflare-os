@@ -44,6 +44,7 @@ import type {
   StructureUpdate,
   SubscriberEvent,
 } from "./lib/protocol.ts";
+import { type Ast, CellError, ERR, isErr, parseFormula, serializeAst } from "./lib/formula.ts";
 
 // The bindings the Workshop's iframe bootstrap defines before this module runs: the RPC stub to
 // this gadget's Durable Object, and Cap'n Web's RpcTarget for the callbacks it is handed.
@@ -386,169 +387,8 @@ interface Matrix {
 // Anything an expression evaluates to.
 type Value = Scalar | CellError | Matrix;
 
-class CellError {
-  declare value: string;
-  constructor(v: string) { this.value = v; }
-  toString() { return this.value; }
-}
-const ERR = {
-  DIV0: () => new CellError("#DIV/0!"),
-  VALUE: () => new CellError("#VALUE!"),
-  REF: () => new CellError("#REF!"),
-  NAME: () => new CellError("#NAME?"),
-  NA: () => new CellError("#N/A"),
-  NUM: () => new CellError("#NUM!"),
-  CYCLE: () => new CellError("#CYCLE!"),
-};
-const isErr = (v: unknown): v is CellError => v instanceof CellError;
 const isMatrix = (v: Value): v is Matrix => typeof v === "object" && v !== null && "matrix" in v;
 
-// --- Tokenizer ---
-type Token =
-  | { t: "str" | "op" | "word"; v: string }
-  | { t: "num"; v: number }
-  | { t: "lp" | "rp" | "comma" | "colon"; v?: undefined };
-
-function tokenize(src: string): Token[] {
-  const tokens: Token[] = [];
-  let i = 0;
-  const n = src.length;
-  while (i < n) {
-    const ch = src[i];
-    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") { i++; continue; }
-    if (ch === '"') {
-      let j = i + 1, str = "";
-      while (j < n) {
-        if (src[j] === '"') { if (src[j + 1] === '"') { str += '"'; j += 2; continue; } j++; break; }
-        str += src[j++];
-      }
-      tokens.push({ t: "str", v: str }); i = j; continue;
-    }
-    if (/[0-9]/.test(ch) || (ch === "." && /[0-9]/.test(src[i + 1] || ""))) {
-      let j = i;
-      while (j < n && /[0-9.]/.test(src[j])) j++;
-      if (src[j] === "e" || src[j] === "E") { j++; if (src[j] === "+" || src[j] === "-") j++; while (j < n && /[0-9]/.test(src[j])) j++; }
-      tokens.push({ t: "num", v: parseFloat(src.slice(i, j)) }); i = j; continue;
-    }
-    const two = src.slice(i, i + 2);
-    if (two === "<=" || two === ">=" || two === "<>") { tokens.push({ t: "op", v: two }); i += 2; continue; }
-    if ("+-*/^&=<>%".includes(ch)) { tokens.push({ t: "op", v: ch }); i++; continue; }
-    if (ch === "(") { tokens.push({ t: "lp" }); i++; continue; }
-    if (ch === ")") { tokens.push({ t: "rp" }); i++; continue; }
-    if (ch === ",") { tokens.push({ t: "comma" }); i++; continue; }
-    if (ch === ":") { tokens.push({ t: "colon" }); i++; continue; }
-    // word: letters/digits/$/./! and quoted sheet names 'My Sheet'!
-    if (/[A-Za-z_$]/.test(ch) || ch === "'") {
-      let j = i, word = "";
-      if (ch === "'") { // 'Sheet Name'!Ref
-        j++;
-        while (j < n && src[j] !== "'") word += src[j++];
-        j++; word = "'" + word + "'";
-      } else {
-        while (j < n && /[A-Za-z0-9_$.]/.test(src[j])) word += src[j++];
-      }
-      if (src[j] === "!") { word += "!"; j++; while (j < n && /[A-Za-z0-9_$]/.test(src[j])) word += src[j++]; }
-      tokens.push({ t: "word", v: word }); i = j; continue;
-    }
-    i++; // skip unknown
-  }
-  return tokens;
-}
-
-// --- Parser (produces AST) ---
-type Ast =
-  | { k: "num"; v: number }
-  | { k: "str"; v: string }
-  | { k: "bool"; v: boolean }
-  | { k: "ref"; ref: string }
-  | { k: "range"; a: string; b: string }
-  | { k: "un"; op: string; a: Ast }
-  | { k: "pct"; a: Ast }
-  | { k: "bin"; op: string; a: Ast; b: Ast }
-  | { k: "call"; name: string; args: Ast[] };
-
-function parseFormula(src: string): Ast {
-  const tokens = tokenize(src);
-  let pos = 0;
-  const peek = (): Token | undefined => tokens[pos];
-  const next = (): Token | undefined => tokens[pos++];
-
-  function parseExpr(minbp = 0): Ast {
-    let left = parseUnary();
-    while (true) {
-      const tk = peek();
-      if (!tk || tk.t !== "op") break;
-      const bp = BP[tk.v];
-      if (bp == null || bp.lbp <= minbp) break;
-      next();
-      const right = parseExpr(bp.lbp - (bp.right ? 1 : 0));
-      left = { k: "bin", op: tk.v, a: left, b: right };
-    }
-    return left;
-  }
-  function parseUnary(): Ast {
-    const tk = peek();
-    if (tk && tk.t === "op" && (tk.v === "-" || tk.v === "+")) { next(); return { k: "un", op: tk.v, a: parseUnary() }; }
-    let node = parsePrimary();
-    // postfix percent
-    while (peek() && peek()!.t === "op" && peek()!.v === "%") { next(); node = { k: "pct", a: node }; }
-    return node;
-  }
-  function parsePrimary(): Ast {
-    const tk = next();
-    if (!tk) throw ERR.VALUE();
-    if (tk.t === "num") return { k: "num", v: tk.v };
-    if (tk.t === "str") return { k: "str", v: tk.v };
-    if (tk.t === "lp") { const e = parseExpr(0); if (peek() && peek()!.t === "rp") next(); return e; }
-    if (tk.t === "word") {
-      if (peek() && peek()!.t === "lp") {
-        next();
-        const args: Ast[] = [];
-        if (!(peek() && peek()!.t === "rp")) {
-          args.push(parseExpr(0));
-          while (peek() && peek()!.t === "comma") { next(); args.push(parseExpr(0)); }
-        }
-        if (peek() && peek()!.t === "rp") next();
-        return { k: "call", name: tk.v.toUpperCase(), args };
-      }
-      const up = tk.v.toUpperCase();
-      if (up === "TRUE") return { k: "bool", v: true };
-      if (up === "FALSE") return { k: "bool", v: false };
-      // reference — possibly a range with colon
-      let ref: Ast = { k: "ref", ref: tk.v };
-      // TODO(types): the token after the colon is taken as-is, so `A1:5` or `A1:(` stores a number
-      // or `undefined` as the range end; evaluation then fails with #VALUE!, as it always has.
-      if (peek() && peek()!.t === "colon") { next(); const r2 = next(); ref = { k: "range", a: tk.v, b: r2 ? (r2.v as string) : "" }; }
-      return ref;
-    }
-    throw ERR.VALUE();
-  }
-  const ast = parseExpr(0);
-  return ast;
-}
-const BP: Record<string, { lbp: number; right?: boolean }> = {
-  "=": { lbp: 1 }, "<>": { lbp: 1 }, "<": { lbp: 1 }, ">": { lbp: 1 }, "<=": { lbp: 1 }, ">=": { lbp: 1 },
-  "&": { lbp: 2 },
-  "+": { lbp: 3 }, "-": { lbp: 3 },
-  "*": { lbp: 4 }, "/": { lbp: 4 },
-  "^": { lbp: 5, right: true },
-};
-
-// --- Serializer (AST -> string), used for ref adjustment on insert/delete ---
-function serializeAst(node: Ast): string {
-  switch (node.k) {
-    case "num": return String(node.v);
-    case "str": return '"' + node.v.replace(/"/g, '""') + '"';
-    case "bool": return node.v ? "TRUE" : "FALSE";
-    case "ref": return node.ref;
-    case "range": return node.a + ":" + node.b;
-    case "un": return node.op + serializeAst(node.a);
-    case "pct": return serializeAst(node.a) + "%";
-    case "bin": return serializeAst(node.a) + node.op + serializeAst(node.b);
-    case "call": return node.name + "(" + node.args.map(serializeAst).join(",") + ")";
-  }
-  return "";
-}
 
 // ===========================================================================
 // Number coercion + formatting
@@ -768,6 +608,7 @@ function makeEngine(model: Model): Engine {
       case "num": return node.v;
       case "str": return node.v;
       case "bool": return node.v;
+      case "paren": return evalNode(node.a, ctx);
       case "pct": return divSafe(toNum(evalNode(node.a, ctx)), 100);
       case "ref": {
         const p = splitRef(node.ref, ctx.sheetId);
@@ -2207,12 +2048,11 @@ gridScroll.addEventListener("keydown", (e) => {
       case "z": e.preventDefault(); e.shiftKey ? redo() : undo(); return;
       case "y": e.preventDefault(); redo(); return;
       case "c": copySelection(); return;
-      // TODO(types): `_cut` is an expando nothing reads; kept as it was, typed as such.
-      case "x": copySelection(); (e as KeyboardEvent & { _cut?: boolean })._cut = true; return;
+      case "x": copySelection(); return;
       case "v": return; // handled by paste event
       case "a": e.preventDefault(); { const sh = curSheet(); setSelection({ r: 0, c: 0 }, { r: sh.rows - 1, c: sh.cols - 1 }); focus = { r: 0, c: 0 }; updateSelectionUI(); } return;
-      case "arrowdown": e.preventDefault(); moveActive(jumpEdge(focus.r, focus.c, 1, 0), focus.c, e.shiftKey); return;
-      case "arrowup": e.preventDefault(); moveActive(jumpEdge(focus.r, focus.c, -1, 0), focus.c, e.shiftKey); return;
+      case "arrowdown": e.preventDefault(); moveActive(jumpEdge(focus.r, focus.c, 1), focus.c, e.shiftKey); return;
+      case "arrowup": e.preventDefault(); moveActive(jumpEdge(focus.r, focus.c, -1), focus.c, e.shiftKey); return;
       case "arrowright": e.preventDefault(); moveActive(focus.r, jumpEdgeCol(focus.r, focus.c, 1), e.shiftKey); return;
       case "arrowleft": e.preventDefault(); moveActive(focus.r, jumpEdgeCol(focus.r, focus.c, -1), e.shiftKey); return;
     }
@@ -2235,9 +2075,7 @@ gridScroll.addEventListener("keydown", (e) => {
       if (e.key.length === 1 && !meta && !e.altKey) { e.preventDefault(); startEdit(rcToRef(focus.r, focus.c), true, e.key); }
   }
 });
-// TODO(types): both callers pass a fourth argument (`0`) that was always ignored; declared so the
-// calls type-check unchanged.
-function jumpEdge(r: number, c: number, dr: number, _dc?: number): number {
+function jumpEdge(r: number, c: number, dr: number): number {
   const sh = curSheet();
   let nr = r + dr;
   const has = (rr: number) => { const v = cellRaw(rcToRef(rr, c)); return v !== "" && v != null; };
