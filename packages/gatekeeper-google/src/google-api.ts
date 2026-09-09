@@ -398,6 +398,58 @@ function foldBase64(value: string): string {
   return value.match(/.{1,76}/g)?.join('\r\n') ?? '';
 }
 
+// Largest single inline image to embed (raw bytes; base64 inflates ~33%).
+const MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024;
+// Total embedded-image budget per message, so one email can't produce absurd HTML.
+const MAX_TOTAL_INLINE_IMAGE_BYTES = 2 * 1024 * 1024;
+
+function bytesToBase64(data: ArrayBuffer | Uint8Array): string {
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+// Replace `cid:` <img> references with `data:` URIs from the message's inline attachments, so
+// embedded images render in a sandboxed iframe (which cannot resolve the cid: scheme). Unresolved
+// references (missing, non-image, too large, or over budget) are left untouched.
+function inlineCidImages(
+    html: string,
+    attachments: ReadonlyArray<import("postal-mime").Attachment>): string {
+  if (!html) return html;
+  const byCid = new Map<string, { mimeType: string; content: ArrayBuffer | Uint8Array | string }>();
+  for (const att of attachments) {
+    if (!att.contentId || !att.mimeType?.toLowerCase().startsWith('image/')) continue;
+    const id = att.contentId.trim().replace(/^</, '').replace(/>$/, '').toLowerCase();
+    if (id) byCid.set(id, { mimeType: att.mimeType, content: att.content });
+  }
+  if (byCid.size === 0) return html;
+
+  let totalInlined = 0;
+  const cache = new Map<string, string | null>();
+  const resolve = (rawCid: string): string | null => {
+    const id = rawCid.trim().replace(/^cid:/i, '').replace(/^</, '').replace(/>$/, '').toLowerCase();
+    if (cache.has(id)) return cache.get(id)!;
+    const att = byCid.get(id);
+    if (!att || typeof att.content === 'string') { cache.set(id, null); return null; }
+    const bytes = att.content instanceof Uint8Array ? att.content : new Uint8Array(att.content);
+    if (bytes.byteLength > MAX_INLINE_IMAGE_BYTES ||
+        totalInlined + bytes.byteLength > MAX_TOTAL_INLINE_IMAGE_BYTES) { cache.set(id, null); return null; }
+    totalInlined += bytes.byteLength;
+    const uri = `data:${att.mimeType};base64,${bytesToBase64(bytes)}`;
+    cache.set(id, uri);
+    return uri;
+  };
+
+  return html
+    .replace(/(\ssrc\s*=\s*")cid:([^"]+)(")/gi, (m, p, cid, s) => { const u = resolve(cid); return u ? `${p}${u}${s}` : m; })
+    .replace(/(\ssrc\s*=\s*')cid:([^']+)(')/gi, (m, p, cid, s) => { const u = resolve(cid); return u ? `${p}${u}${s}` : m; })
+    .replace(/(\ssrc\s*=\s*)cid:([^\s>]+)/gi,   (m, p, cid)   => { const u = resolve(cid); return u ? `${p}"${u}"`  : m; });
+}
+
 function utf8ToBase64(value: string): string {
   const bytes = new TextEncoder().encode(value);
   let binary = '';
@@ -781,7 +833,9 @@ export class GmailApi {
       },
       content: {
         ...(parsed.text != null ? { text: parsed.text.trim() } : {}),
-        ...(parsed.html != null ? { html: parsed.html.trim() } : {}),
+        ...(parsed.html != null
+          ? { html: inlineCidImages(parsed.html.trim(), parsed.attachments ?? []) }
+          : {}),
       },
     };
   }
