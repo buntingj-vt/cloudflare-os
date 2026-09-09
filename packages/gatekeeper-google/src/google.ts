@@ -1405,10 +1405,22 @@ function describeOutboundMessage(intro: string, message: GmailOutboundMessage): 
   return `${intro}\n\n${fields.join("\n\n")}`;
 }
 
+// Gmail thread actions that are safe to auto-apply once the user opts in to the kind. markRead and
+// markUnread are pure read-state toggles; archive only removes a thread from the inbox and is
+// reversible. trash, send, reply and forward are deliberately excluded and always require manual
+// review (deletion / outbound content).
+const GMAIL_MARK_READ_ACTION: ActionKind = { tag: "gmailMarkRead", label: "Mark read / unread" };
+const GMAIL_ARCHIVE_ACTION: ActionKind = { tag: "gmailArchive", label: "Archive (remove from inbox)" };
+
 async function submitGmailAction(
     ctx: GmailSessionContext,
     action: GmailAction,
-    desc: { title: string; description: string }): Promise<void> {
+    desc: {
+      title: string;
+      description: string;
+      actionKind?: ActionKind;
+      autoApprovable?: boolean;
+    }): Promise<void> {
   if (ctx.pendingActions.list().length >= 100) {
     throw new Error("Too many pending Gmail actions. Resolve existing actions before adding more.");
   }
@@ -1605,6 +1617,12 @@ class GmailThreadStub extends RpcTarget implements GmailThread {
       title: sanitizeApprovalTitle(`Read thread before ${titlePrefix.toLowerCase()}: ${subject}`),
       description: "Read the current Gmail thread metadata needed to prepare this action.",
     });
+    // markRead/markUnread and archive are auto-applied once the user opts in to their kind; trash
+    // is intentionally left out and always requires manual approval.
+    const actionKind =
+      type === "archive" ? GMAIL_ARCHIVE_ACTION :
+      type === "markRead" || type === "markUnread" ? GMAIL_MARK_READ_ACTION :
+      undefined;
     await submitGmailAction(
       this.#ctx,
       { type, threadId: this.#threadId },
@@ -1616,6 +1634,8 @@ class GmailThreadStub extends RpcTarget implements GmailThread {
           (info.snippet !== undefined
             ? `\n\n${formatApprovalField("Snippet", info.snippet)}`
             : ""),
+        actionKind,
+        autoApprovable: actionKind !== undefined,
       });
   }
 
@@ -1858,8 +1878,9 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
     return TYPES_CODE;
   }
 
-  async getAutoApprovableActions() {
-    return [];
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    // Only benign, reversible thread actions. trash/send/reply/forward stay manual.
+    return [GMAIL_MARK_READ_ACTION, GMAIL_ARCHIVE_ACTION];
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
