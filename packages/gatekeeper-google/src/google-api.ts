@@ -1944,6 +1944,48 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+// Largest single inline image to embed (raw bytes; base64 inflates ~33%).
+const MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024;
+// Total embedded-image budget per message, so one email can't produce absurd HTML.
+const MAX_TOTAL_INLINE_IMAGE_BYTES = 2 * 1024 * 1024;
+
+// Replace `cid:` <img> references with `data:` URIs from the message's inline attachments, so
+// embedded images render in a sandboxed iframe (which cannot resolve the cid: scheme). Unresolved
+// references (missing, non-image, too large, or over budget) are left untouched.
+function inlineCidImages(
+    html: string,
+    attachments: ReadonlyArray<import("postal-mime").Attachment>): string {
+  if (!html) return html;
+  const byCid = new Map<string, { mimeType: string; content: ArrayBuffer | Uint8Array | string }>();
+  for (const att of attachments) {
+    if (!att.contentId || !att.mimeType?.toLowerCase().startsWith("image/")) continue;
+    const id = att.contentId.trim().replace(/^</, "").replace(/>$/, "").toLowerCase();
+    if (id) byCid.set(id, { mimeType: att.mimeType, content: att.content });
+  }
+  if (byCid.size === 0) return html;
+
+  let totalInlined = 0;
+  const cache = new Map<string, string | null>();
+  const resolve = (rawCid: string): string | null => {
+    const id = rawCid.trim().replace(/^cid:/i, "").replace(/^</, "").replace(/>$/, "").toLowerCase();
+    if (cache.has(id)) return cache.get(id)!;
+    const att = byCid.get(id);
+    if (!att || typeof att.content === "string") { cache.set(id, null); return null; }
+    const bytes = att.content instanceof Uint8Array ? att.content : new Uint8Array(att.content);
+    if (bytes.byteLength > MAX_INLINE_IMAGE_BYTES ||
+        totalInlined + bytes.byteLength > MAX_TOTAL_INLINE_IMAGE_BYTES) { cache.set(id, null); return null; }
+    totalInlined += bytes.byteLength;
+    const uri = `data:${att.mimeType};base64,${bytesToBase64(bytes)}`;
+    cache.set(id, uri);
+    return uri;
+  };
+
+  return html
+    .replace(/(\ssrc\s*=\s*")cid:([^"]+)(")/gi, (m, p, cid, s) => { const u = resolve(cid); return u ? `${p}${u}${s}` : m; })
+    .replace(/(\ssrc\s*=\s*')cid:([^']+)(')/gi, (m, p, cid, s) => { const u = resolve(cid); return u ? `${p}${u}${s}` : m; })
+    .replace(/(\ssrc\s*=\s*)cid:([^\s>]+)/gi,   (m, p, cid)   => { const u = resolve(cid); return u ? `${p}"${u}"`  : m; });
+}
+
 function postalAttachmentBytes(
     content: ArrayBuffer | Uint8Array | string, contentType: string,
     exactBytes?: Uint8Array): Uint8Array {
@@ -2717,7 +2759,9 @@ export class GmailApi {
       info: messageInfoFromParsed(message, parsed),
       content: {
         ...(parsed.text != null ? { text: parsed.text } : {}),
-        ...(parsed.html != null ? { html: parsed.html } : {}),
+        ...(parsed.html != null
+          ? { html: inlineCidImages(parsed.html, parsed.attachments ?? []) }
+          : {}),
       },
     };
   }
