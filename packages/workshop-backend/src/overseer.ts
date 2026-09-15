@@ -8812,15 +8812,20 @@ class OverseerImpl implements AgentHooks {
   }
 
   async getInstanceInstructions(): Promise<string> {
+    // Source-managed slice, delivered as a Worker var (see the deployment repo's deploy.ts and
+    // gen-harness-manifest.ts). Composed with the admin-authored text so the /admin field stays
+    // human-editable and a source change ships atomically with the deploy rather than by hand.
+    let source = ((this.env as {SOURCE_INSTRUCTIONS?: string}).SOURCE_INSTRUCTIONS ?? "").trim();
+    let admin = "";
     try {
       // Cheap single KV get from the mirror AdminSettings maintains; avoids the singleton DO.
-      return (await readAdminConfig(this.env)).instanceInstructions;
+      admin = (await readAdminConfig(this.env)).instanceInstructions;
     } catch (err) {
       this.logger.warn("failed to read instance instructions", {
         event: "instance.instructions.read.failed", error: err,
       });
-      return "";
     }
+    return [source, admin].map(s => s.trim()).filter(Boolean).join("\n\n");
   }
 
   async listConnectableVendors(): Promise<{id: string, displayName: string}[]> {
