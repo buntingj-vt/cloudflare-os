@@ -3,7 +3,6 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useKumoToastManager } from "@cloudflare/kumo";
 import { ChatInput } from "../ChatInterface";
-import MeshBackground from "../components/MeshBackground";
 import HomeTaskSuggestions from "../components/AppShell/HomeTaskSuggestions";
 import { useAuthenticatedApi } from "../AuthContext";
 import { RpcStub } from "capnweb";
@@ -152,23 +151,9 @@ export function HomePageContent({ prompt }: HomeSearch) {
   );
 
   return (
-    // Flat enterprise treatment: no mesh, no watermark hexagon, no prompt-glow. The AppShell's
-    // <main> already supplies a faint dotted grid as the page background.
+    // The warm ambient backdrop (dotted grid + cursor glow) is supplied globally by the AppShell,
+    // so the home page adds no backdrop of its own — just the centered hero + composer column.
     <div className="relative isolate flex min-h-full w-full flex-col items-center justify-start px-4 pb-16 pt-10 sm:px-8 sm:pt-16 lg:pt-24">
-      {/* The brand hex mesh, restored and de-warmed for the new system: a gentle perspective hex
-          grid receding upward. Masked to fade out before the composer so it stays a quiet backdrop. */}
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[460px] overflow-hidden"
-        style={{
-          maskImage:
-            "linear-gradient(to bottom, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 45%, rgba(0,0,0,0) 95%)",
-          WebkitMaskImage:
-            "linear-gradient(to bottom, rgba(0,0,0,1) 0%, rgba(0,0,0,1) 45%, rgba(0,0,0,0) 95%)",
-        }}
-      >
-        <MeshBackground />
-      </div>
       <div className="flex w-full max-w-2xl flex-col items-stretch gap-8">
         {/* Hero */}
         <header className="text-center">
