@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useRouterState } from '@tanstack/react-router'
 import { List, X } from '@phosphor-icons/react'
 import TopBarNotice from '../../TopBarNotice'
+import AmbientBackground from '../AmbientBackground'
 import ReconnectingChip from '../ReconnectingChip'
 import { useConnectionLost } from '../../RpcContext'
 import Sidebar from './Sidebar'
@@ -107,7 +108,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }, [])
 
   return (
-    <div className="flex h-full min-h-0 w-full overflow-hidden bg-kumo-base">
+    <div className="relative flex h-full min-h-0 w-full overflow-hidden">
+      {/* Ambient backdrop (dotted grid + cursor-follow warm glow). Fixed to the viewport behind
+          all content; shows through the transparent content canvas while chrome stays solid. */}
+      <AmbientBackground />
+
       {/* Desktop sidebar — hidden on mobile in favor of the drawer. */}
       <div className="hidden h-full md:flex">
         <Sidebar collapsed={collapsed} onToggleCollapsed={toggleCollapsed} />
