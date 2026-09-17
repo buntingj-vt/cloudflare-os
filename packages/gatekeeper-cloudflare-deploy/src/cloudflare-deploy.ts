@@ -36,7 +36,18 @@ import TYPES_CODE from "./types.txt";
 
 type Env = Cloudflare.Env & {
   BASE_URL?: string;
+  /** Build service endpoint (Phase 2). Set as a var; the secret below authenticates to it. */
+  BUILD_SERVICE_URL?: string;
+  BUILD_SERVICE_SECRET?: string;
 };
+
+interface BuildServiceFile {
+  path: string;
+  contentBase64: string;
+}
+type BuildServiceResponse =
+  | { ok: true; type: string; entry: string; files: BuildServiceFile[]; totalBytes: number }
+  | { ok: false; error: string; stage: string; log?: string };
 
 const NONCE_BYTES = 32;
 const NONCE_LIFETIME_MS = 10 * 60 * 1000;
@@ -82,6 +93,16 @@ function slugifyName(name: string): string {
   if (!slug) slug = "demo";
   if (!/^[a-z]/.test(slug)) slug = `demo-${slug}`;
   return slug.slice(0, 54);
+}
+
+/** Default demo name from a git URL's last path segment (e.g. .../owner/repo(.git) -> "repo"). */
+function repoNameFromUrl(repoUrl: string): string {
+  try {
+    const parts = new URL(repoUrl).pathname.replace(/\.git$/, "").split("/").filter(Boolean);
+    return parts[parts.length - 1] || "demo";
+  } catch {
+    return "demo";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -578,6 +599,18 @@ interface DeployActionData {
   hostname: string;
   submittedAt: number;
 }
+interface DeployRepoActionData {
+  type: "deployRepo";
+  id: number;
+  scriptName: string;
+  repoUrl: string;
+  ref?: string;
+  private: boolean;
+  accessEmail?: string;
+  url: string;
+  hostname: string;
+  submittedAt: number;
+}
 interface TeardownActionData {
   type: "teardown";
   id: number;
@@ -585,7 +618,7 @@ interface TeardownActionData {
   hostname: string;
   submittedAt: number;
 }
-type CfAction = DeployActionData | TeardownActionData;
+type CfAction = DeployActionData | DeployRepoActionData | TeardownActionData;
 
 type PendingActionRow = { id: number; action: CfAction };
 type AppliedActionRow = { id: number; action: CfAction; appliedAt: number };
@@ -652,25 +685,16 @@ export class CloudflareDeployGatekeeperImpl
     const api = await this.#api();
     try {
       if (action.type === "deploy") {
-        const subdomain = await this.#subdomain();
         const files: DeployFile[] = action.files.map((f) => ({
           path: f.path,
           bytes: base64ToBytes(f.contentBase64),
           contentType: f.contentType,
         }));
-        await api.deployStaticSite(action.scriptName, files);
-        await api.enableSubdomain(action.scriptName, subdomain);
-        if (action.private && action.accessEmail) {
-          await api.ensureAccessApp(action.hostname, action.accessEmail);
-        }
-        this.#putDemo({
-          id: action.scriptName,
-          name: action.scriptName,
-          url: action.url,
-          private: action.private,
-          status: "live",
-          createdAt: pending.action.submittedAt,
-        });
+        await this.#applyDeploy(api, action, files);
+      } else if (action.type === "deployRepo") {
+        // Clone + build happen now (only after approval), then the same deploy loop.
+        const files = await this.#buildRepo(action.repoUrl, action.ref);
+        await this.#applyDeploy(api, action, files);
       } else {
         await api.deleteScript(action.scriptName);
         await api.deleteAccessAppForDomain(action.hostname);
@@ -686,9 +710,51 @@ export class CloudflareDeployGatekeeperImpl
     this.#deletePending(actionId);
   }
 
+  async #applyDeploy(
+    api: CloudflareDeployApi,
+    action: DeployActionData | DeployRepoActionData,
+    files: DeployFile[],
+  ): Promise<void> {
+    const subdomain = await this.#subdomain();
+    await api.deployStaticSite(action.scriptName, files);
+    await api.enableSubdomain(action.scriptName, subdomain);
+    if (action.private && action.accessEmail) {
+      await api.ensureAccessApp(action.hostname, action.accessEmail);
+    }
+    this.#putDemo({
+      id: action.scriptName,
+      name: action.scriptName,
+      url: action.url,
+      private: action.private,
+      status: "live",
+      createdAt: action.submittedAt,
+    });
+  }
+
+  /** Call the build service to clone+build a repo and return its static output as deploy files. */
+  async #buildRepo(repoUrl: string, ref?: string): Promise<DeployFile[]> {
+    const url = this.env.BUILD_SERVICE_URL;
+    const secret = this.env.BUILD_SERVICE_SECRET;
+    if (!url || !secret) {
+      throw new Error(
+        "The build service isn't configured — set BUILD_SERVICE_URL and BUILD_SERVICE_SECRET on " +
+          "the Cloudflare deploy gatekeeper to enable GitHub-repo builds.",
+      );
+    }
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
+      body: JSON.stringify({ repoUrl, ref }),
+    });
+    const data = (await resp.json().catch(() => null)) as BuildServiceResponse | null;
+    if (!data) throw new Error(`Build service returned a non-JSON response (HTTP ${resp.status}).`);
+    if (!data.ok) throw new Error(`Build failed at ${data.stage}: ${data.error}`);
+    return data.files.map((f) => ({ path: f.path, bytes: base64ToBytes(f.contentBase64) }));
+  }
+
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
     const pending = this.#getPending(actionId);
-    if (pending?.action.type === "deploy") {
+    if (pending?.action.type === "deploy" || pending?.action.type === "deployRepo") {
       // The provisional (pending) demo never went live; drop it if it's still pending.
       const demo = this.#getDemo(pending.action.scriptName);
       if (demo?.status === "pending") this.#deleteDemo(pending.action.scriptName);
@@ -701,7 +767,9 @@ export class CloudflareDeployGatekeeperImpl
   ): Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
     const applied = this.#getApplied(actionId);
     if (!applied) throw new Error(`No applied Cloudflare deploy action exists with id ${actionId}.`);
-    if (applied.action.type !== "deploy") throw new Error("This action cannot be reverted.");
+    if (applied.action.type !== "deploy" && applied.action.type !== "deployRepo") {
+      throw new Error("This action cannot be reverted.");
+    }
     // Reverting a deploy removes the demo (delete the script + its Access app).
     const api = await this.#api();
     await api.deleteScript(applied.action.scriptName);
@@ -756,6 +824,59 @@ export class CloudflareDeployGatekeeperImpl
       implementsRevert: true,
       awaitDecision: true,
       actionKind: { tag: "deploy-demo", label: "Deploy demo" },
+    };
+    try {
+      await approvalQueue.submitAction(id, description);
+    } catch (e) {
+      this.#deletePending(id);
+      if (this.#getDemo(scriptName)?.status === "pending") this.#deleteDemo(scriptName);
+      throw e;
+    }
+    return { id: scriptName, name: scriptName, url, private: isPrivate, status: "pending", createdAt: submittedAt };
+  }
+
+  async submitDeployRepo(
+    approvalQueue: RpcStub<ApprovalQueue>,
+    name: string,
+    repoUrl: string,
+    options: (DeployOptions & { ref?: string }) | undefined,
+  ): Promise<DemoDeployment> {
+    if (!repoUrl) throw new Error("A repo URL is required.");
+    if (!this.env.BUILD_SERVICE_URL || !this.env.BUILD_SERVICE_SECRET) {
+      throw new Error(
+        "The build service isn't configured — set BUILD_SERVICE_URL and BUILD_SERVICE_SECRET on " +
+          "the Cloudflare deploy gatekeeper to enable GitHub-repo builds.",
+      );
+    }
+    const creds = await this.#getCreds();
+    const isPrivate = options?.private ?? true;
+    const accessEmail = options?.accessEmail ?? creds.ownerEmail;
+    if (isPrivate && !accessEmail) throw new Error("A private demo needs an accessEmail.");
+
+    const scriptName = slugifyName(name || repoNameFromUrl(repoUrl));
+    const subdomain = await this.#subdomain();
+    const hostname = `${scriptName}.${subdomain}.workers.dev`;
+    const url = `https://${hostname}`;
+    const id = this.#nextActionId();
+    const submittedAt = Date.now();
+
+    const action: DeployRepoActionData = {
+      type: "deployRepo", id, scriptName, repoUrl, ref: options?.ref, private: isPrivate,
+      accessEmail: isPrivate ? accessEmail : undefined, url, hostname, submittedAt,
+    };
+    this.ctx.storage.kv.put<PendingActionRow>(`pending:${id}`, { id, action });
+    this.#putDemo({ id: scriptName, name: scriptName, url, private: isPrivate, status: "pending", createdAt: submittedAt });
+
+    const description: ActionDescription = {
+      title: `Deploy demo "${scriptName}" from ${repoUrl}`,
+      description:
+        `Clone ${repoUrl}${options?.ref ? ` (ref ${options.ref})` : ""}, build it in a container, and ` +
+        `deploy the static output as an assets-only Worker at ${url}` +
+        (isPrivate ? `, gated by Cloudflare Access for ${accessEmail}` : " (public)") +
+        `. Reverting removes the demo.`,
+      implementsRevert: true,
+      awaitDecision: true,
+      actionKind: { tag: "deploy-repo", label: "Deploy demo from repo" },
     };
     try {
       await approvalQueue.submitAction(id, description);
@@ -878,6 +999,14 @@ class CloudflareDeploySessionImpl extends RpcTarget implements CloudflareDeployS
 
   async deployStaticSite(name: string, files: DemoFile[], options?: DeployOptions): Promise<DemoDeployment> {
     return await this.#gk.submitDeploy(this.#approvalQueue, name, files, options);
+  }
+
+  async deployFromRepo(
+    name: string,
+    repoUrl: string,
+    options?: DeployOptions & { ref?: string },
+  ): Promise<DemoDeployment> {
+    return await this.#gk.submitDeployRepo(this.#approvalQueue, name, repoUrl, options);
   }
 
   async teardownDemo(name: string): Promise<void> {

@@ -95,6 +95,25 @@ export interface CloudflareDeploySession extends RpcTarget {
   ): Promise<DemoDeployment>;
 
   /**
+   * Build a GitHub repo (or any git URL) in a container and deploy its static output as a private
+   * demo. QUEUED FOR APPROVAL — the clone+build+deploy runs only after you approve it.
+   *
+   * The repo must produce static output: either a `build` script whose output lands in
+   * dist/build/out/public, or a plain `index.html` at the root. Full-stack/server apps aren't
+   * supported. Requires the build service to be configured on the gatekeeper.
+   *
+   * @param name Desired demo name (slugified; read the returned name/url for the final value).
+   * @param repoUrl https git URL, e.g. "https://github.com/owner/repo".
+   * @param options `ref` selects a branch/tag; plus the usual privacy options.
+   * @example const demo = await session.deployFromRepo("acme", "https://github.com/acme/site");
+   */
+  deployFromRepo(
+    name: string,
+    repoUrl: string,
+    options?: DeployOptions & { ref?: string },
+  ): Promise<DemoDeployment>;
+
+  /**
    * Tear down a demo: delete the Worker script and its Access app. QUEUED FOR APPROVAL.
    * @example await session.teardownDemo("acme-landing");
    */
