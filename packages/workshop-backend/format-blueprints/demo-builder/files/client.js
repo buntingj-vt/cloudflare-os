@@ -79,7 +79,7 @@ let sourceTab = "html"; // "html" | "url"
 let notice = null; // { kind: "ok"|"err", text }
 const busy = new Set();
 // Preserve form field values across re-renders.
-const form = { name: "", html: "", url: "" };
+const form = { name: "", html: "", url: "", repoUrl: "", ref: "" };
 
 async function refresh() {
   state = await gadget.getState();
@@ -141,7 +141,7 @@ function renderNewDemo() {
   const tabs = el("div", { class: "tabs" }, [
     tab("html", "Paste HTML", false),
     tab("url", "From URL", false),
-    tab("repo", "GitHub repo (soon)", true),
+    tab("repo", "GitHub repo", false),
   ]);
 
   let sourceField;
@@ -160,7 +160,7 @@ function renderNewDemo() {
       form.name = ""; form.html = "";
       notice = { kind: "ok", text: `Queued "${r.demo.name}" for approval → ${r.demo.url}` };
     });
-  } else {
+  } else if (sourceTab === "url") {
     const urlInput = el("input", { type: "url", placeholder: "https://example.com/page.html" });
     urlInput.value = form.url;
     urlInput.addEventListener("input", () => { form.url = urlInput.value; });
@@ -169,6 +169,23 @@ function renderNewDemo() {
     onDeploy = () => withBusy("deploy", async () => {
       const r = await gadget.deployFromUrl(nameInput.value, urlInput.value);
       form.name = ""; form.url = "";
+      notice = { kind: "ok", text: `Queued "${r.demo.name}" for approval → ${r.demo.url}` };
+    });
+  } else {
+    const repoInput = el("input", { type: "url", placeholder: "https://github.com/owner/repo" });
+    repoInput.value = form.repoUrl;
+    repoInput.addEventListener("input", () => { form.repoUrl = repoInput.value; });
+    const refInput = el("input", { type: "text", placeholder: "branch or tag (optional)" });
+    refInput.value = form.ref;
+    refInput.addEventListener("input", () => { form.ref = refInput.value; });
+    sourceField = el("div", {}, [
+      el("label", { class: "fld" }, "GitHub repo URL"), repoInput,
+      el("div", { class: "hint" }, "Cloned and built in a Cloudflare container on approval. Must produce static output — a build script (→ dist/build/out/public) or a root index.html. Building can take a few minutes."),
+      el("label", { class: "fld" }, "Branch / tag"), refInput,
+    ]);
+    onDeploy = () => withBusy("deploy", async () => {
+      const r = await gadget.deployFromRepo(nameInput.value, repoInput.value, refInput.value.trim() || undefined);
+      form.name = ""; form.repoUrl = ""; form.ref = "";
       notice = { kind: "ok", text: `Queued "${r.demo.name}" for approval → ${r.demo.url}` };
     });
   }

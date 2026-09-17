@@ -115,6 +115,17 @@ export class Gadget extends DurableObject {
     return { demo, state: await this.getState() };
   }
 
+  // Clone + build a GitHub repo in a container (via the gatekeeper's build service) and deploy its
+  // static output as a private demo. The clone/build runs only after you approve the action.
+  async deployFromRepo(name, repoUrl, ref) {
+    const deploy = this.#requireDeploy();
+    const url = String(repoUrl ?? "").trim();
+    if (!url) throw new Error("A GitHub repo URL is required.");
+    const options = ref && String(ref).trim() ? { ref: String(ref).trim() } : undefined;
+    const demo = await deploy.deployFromRepo(String(name || ""), url, options);
+    return { demo, state: await this.getState() };
+  }
+
   async teardown(name) {
     const deploy = this.#requireDeploy();
     await deploy.teardownDemo(String(name));
