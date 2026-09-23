@@ -86,6 +86,48 @@
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/cloudflare"
       }
     },
+    "gatekeeper-cloudflare-deploy": {
+      "bindings": [],
+      "compatibilityDate": "2026-09-04",
+      "compatibilityFlags": [
+        "allow_irrevocable_stub_storage",
+        "nodejs_als"
+      ],
+      "inputs": [],
+      "installable": true,
+      "kind": "gatekeeper",
+      "mainModule": "cloudflare-deploy.js",
+      "migrations": [
+        {
+          "new_sqlite_classes": [
+            "UserAccount",
+            "CloudflareDeployGatekeeperImpl"
+          ],
+          "tag": "v0"
+        }
+      ],
+      "modules": [
+        {
+          "name": "cloudflare-deploy.js",
+          "r2Key": "blobs/modules/00398e30aace06495367f001c2288bd83ca0972e1320a56cb13f7e6c9a98218d",
+          "sha256": "00398e30aace06495367f001c2288bd83ca0972e1320a56cb13f7e6c9a98218d",
+          "size": 70,
+          "type": "esm"
+        }
+      ],
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
+      },
+      "shortName": "cloudflaredeploy",
+      "singleton": true,
+      "vars": {
+        "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/cloudflaredeploy"
+      }
+    },
     "gatekeeper-confluence": {
       "bindings": [
         {
