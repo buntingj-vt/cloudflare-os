@@ -48,6 +48,8 @@ style.textContent = `
   .badge.live { background: var(--green-bg); color: var(--green-fg); }
   .badge.failed { background: var(--red-bg); color: var(--red-fg); }
   .demo-err { font-size: 0.82rem; color: var(--red-fg); word-break: break-word; margin-top: 2px; }
+  .tag { font-size: 0.66rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; background: var(--accent); color: white; border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: 1px; }
+  .ttl { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
   .lock { font-size: 0.78rem; color: var(--muted); }
   .empty { color: var(--muted); font-style: italic; font-size: 0.9rem; }
   .acct { font-size: 0.85rem; color: var(--muted); }
@@ -71,6 +73,13 @@ function el(tag, attrs = {}, children = []) {
     node.append(c instanceof Node ? c : document.createTextNode(String(c)));
   }
   return node;
+}
+
+function ttlLabel(expiresAt) {
+  const ms = expiresAt - Date.now();
+  if (ms <= 0) return "soon";
+  const h = Math.round(ms / 3600000);
+  return h >= 1 ? `in ~${h}h` : `in ~${Math.max(1, Math.round(ms / 60000))}m`;
 }
 
 const app = el("div", { id: "app" });
@@ -182,7 +191,7 @@ function renderNewDemo() {
     refInput.addEventListener("input", () => { form.ref = refInput.value; });
     sourceField = el("div", {}, [
       el("label", { class: "fld" }, "GitHub repo URL"), repoInput,
-      el("div", { class: "hint" }, "Cloned and built in a Cloudflare container on approval. Must produce static output — a build script (→ dist/build/out/public) or a root index.html. Building can take a few minutes."),
+      el("div", { class: "hint" }, "Cloned and built in a Cloudflare container on approval. Static sites (dist/build/out/public or a root index.html) or SSR frameworks like Next.js (deployed as a live server Worker, auto-expiring after 24h). Building can take a few minutes."),
       el("label", { class: "fld" }, "Branch / tag"), refInput,
     ]);
     onDeploy = () => withBusy("deploy", async () => {
@@ -227,10 +236,15 @@ function renderDemos() {
     const failed = d.status === "failed";
     const row = el("div", { class: "demo" }, [
       el("div", { class: "demo-main" }, [
-        el("div", { class: "demo-name" }, [d.name, " ", el("span", { class: "lock" }, d.private ? "🔒" : "🌐")]),
+        el("div", { class: "demo-name" }, [
+          d.name, " ",
+          el("span", { class: "lock" }, d.private ? "🔒" : "🌐"),
+          d.kind === "worker" ? el("span", { class: "tag" }, "server") : null,
+        ]),
         failed
           ? el("div", { class: "demo-err" }, d.error || "Build failed.")
           : el("div", { class: "demo-url" }, [el("a", { href: d.url, target: "_blank", rel: "noopener" }, d.url)]),
+        !failed && d.expiresAt ? el("div", { class: "ttl" }, "⏱ auto-expires " + ttlLabel(d.expiresAt)) : null,
       ]),
       el("div", { class: "row" }, [
         el("span", { class: `badge ${d.status}` }, d.status),

@@ -54,6 +54,10 @@ export interface DemoDeployment {
   createdAt: number;
   /** When status is "failed", a human-readable reason (e.g. the build error). */
   error?: string;
+  /** "static" (assets-only) or "worker" (a running SSR server). Absent = legacy static. */
+  kind?: "static" | "worker";
+  /** UNIX millis when a server (worker) demo auto-expires and is torn down. Static demos have none. */
+  expiresAt?: number;
 }
 
 /** Metadata about the connected Cloudflare account deploy target. */

@@ -57,6 +57,9 @@ type BuildContentResponse =
   | { ok: false; error: string };
 
 const NONCE_BYTES = 32;
+// Server (worker) demos run code on the account, so they auto-expire and are torn down by a DO alarm.
+// Static (assets-only) demos are safe + cheap and never expire.
+const WORKER_DEMO_TTL_MS = 24 * 60 * 60 * 1000; // 24h (see docs/demo-builder-backend-support.md §10)
 const NONCE_LIFETIME_MS = 10 * 60 * 1000;
 const ACCOUNT_ID_PATTERN = /^[a-f\d]{32}$/i;
 // Guard against oversized bundles going through DO storage; Phase 2 stages large builds in R2.
@@ -718,7 +721,7 @@ export class CloudflareDeployGatekeeperImpl
                 (paths) => this.#pullBuildContent(build.buildId, paths),
               );
             }
-            await this.#finishDeploy(api, action);
+            await this.#finishDeploy(api, action, build.kind);
           } finally {
             await this.#releaseBuild(build.buildId);
           }
@@ -729,7 +732,7 @@ export class CloudflareDeployGatekeeperImpl
             contentType: f.contentType,
           }));
           await api.deployStaticSite(action.scriptName, files);
-          await this.#finishDeploy(api, action);
+          await this.#finishDeploy(api, action, "static");
         }
       } catch (e) {
         // Expired credentials: let the action re-queue so the user can reconnect and retry.
@@ -777,12 +780,15 @@ export class CloudflareDeployGatekeeperImpl
   async #finishDeploy(
     api: CloudflareDeployApi,
     action: DeployActionData | DeployRepoActionData,
+    kind: "static" | "worker",
   ): Promise<void> {
     const subdomain = await this.#subdomain();
     await api.enableSubdomain(action.scriptName, subdomain);
     if (action.private && action.accessEmail) {
       await api.ensureAccessApp(action.hostname, action.accessEmail);
     }
+    // Server demos run code on the account → give them a TTL and (re)arm the sweep.
+    const expiresAt = kind === "worker" ? Date.now() + WORKER_DEMO_TTL_MS : undefined;
     this.#putDemo({
       id: action.scriptName,
       name: action.scriptName,
@@ -790,7 +796,32 @@ export class CloudflareDeployGatekeeperImpl
       private: action.private,
       status: "live",
       createdAt: action.submittedAt,
+      kind,
+      expiresAt,
     });
+  }
+
+  /**
+   * Tear down any expired server demos, best-effort. This gatekeeper runs as a facet DO, which
+   * cannot set alarms, so expiry is swept lazily on interaction — called at the top of listDemos
+   * (the gadget polls it every few seconds while open). A cheap no-op filter unless something is due.
+   */
+  async sweepExpired(): Promise<void> {
+    const now = Date.now();
+    const due = this.listDemos().filter((d) => d.status === "live" && d.expiresAt && d.expiresAt <= now);
+    if (due.length === 0) return;
+    const api = await this.#api().catch(() => null);
+    const subdomain = api ? await this.#subdomain().catch(() => null) : null;
+    if (!api || !subdomain) return; // creds unavailable — retry on the next sweep
+    for (const demo of due) {
+      try {
+        await api.deleteScript(demo.name);
+        await api.deleteAccessAppForDomain(`${demo.name}.${subdomain}.workers.dev`);
+        this.#deleteDemo(demo.name);
+      } catch {
+        /* leave it; the next sweep retries */
+      }
+    }
   }
 
   #buildServiceCall(body: object): Promise<Response> {
@@ -952,9 +983,10 @@ export class CloudflareDeployGatekeeperImpl
       title: `Deploy demo "${scriptName}" from ${repoUrl}`,
       description:
         `Clone ${repoUrl}${options?.ref ? ` (ref ${options.ref})` : ""}, build it in a container, and ` +
-        `deploy the static output as an assets-only Worker at ${url}` +
+        `deploy it at ${url} — as a static site, or, if it's an SSR framework (e.g. Next.js), as a ` +
+        `live server Worker that runs the repo's code on your Cloudflare account` +
         (isPrivate ? `, gated by Cloudflare Access for ${accessEmail}` : " (public)") +
-        `. Reverting removes the demo.`,
+        `. Server demos auto-expire after 24h. Reverting removes the demo.`,
       implementsRevert: true,
       awaitDecision: true,
       actionKind: { tag: "deploy-repo", label: "Deploy demo from repo" },
@@ -1066,6 +1098,7 @@ class CloudflareDeploySessionImpl extends RpcTarget implements CloudflareDeployS
   }
 
   async listDemos(): Promise<DemoDeployment[]> {
+    await this.#gk.sweepExpired();
     const demos = this.#gk.listDemos();
     await this.#approvalQueue.authorizeObservation({
       title: "List demos",
