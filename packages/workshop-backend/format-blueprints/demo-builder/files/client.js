@@ -46,6 +46,8 @@ style.textContent = `
   .badge { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; border-radius: 999px; padding: 2px 10px; }
   .badge.pending { background: var(--amber-bg); color: var(--amber-fg); }
   .badge.live { background: var(--green-bg); color: var(--green-fg); }
+  .badge.failed { background: var(--red-bg); color: var(--red-fg); }
+  .demo-err { font-size: 0.82rem; color: var(--red-fg); word-break: break-word; margin-top: 2px; }
   .lock { font-size: 0.78rem; color: var(--muted); }
   .empty { color: var(--muted); font-style: italic; font-size: 0.9rem; }
   .acct { font-size: 0.85rem; color: var(--muted); }
@@ -222,21 +224,26 @@ function renderDemos() {
   }
   for (const d of demos) {
     const gone = busy.has(`td:${d.name}`);
+    const failed = d.status === "failed";
     const row = el("div", { class: "demo" }, [
       el("div", { class: "demo-main" }, [
         el("div", { class: "demo-name" }, [d.name, " ", el("span", { class: "lock" }, d.private ? "🔒" : "🌐")]),
-        el("div", { class: "demo-url" }, [el("a", { href: d.url, target: "_blank", rel: "noopener" }, d.url)]),
+        failed
+          ? el("div", { class: "demo-err" }, d.error || "Build failed.")
+          : el("div", { class: "demo-url" }, [el("a", { href: d.url, target: "_blank", rel: "noopener" }, d.url)]),
       ]),
       el("div", { class: "row" }, [
-        el("span", { class: `badge ${d.status === "live" ? "live" : "pending"}` }, d.status),
+        el("span", { class: `badge ${d.status}` }, d.status),
         el("button", {
           class: "danger",
           disabled: gone,
           onclick: () => withBusy(`td:${d.name}`, async () => {
             await gadget.teardown(d.name);
-            notice = { kind: "ok", text: `Queued teardown of "${d.name}" for approval.` };
+            notice = failed
+              ? { kind: "ok", text: `Dismissed "${d.name}".` }
+              : { kind: "ok", text: `Queued teardown of "${d.name}" for approval.` };
           }),
-        }, [gone ? el("span", { class: "spinner" }) : null, "Tear down"]),
+        }, [gone ? el("span", { class: "spinner" }) : null, failed ? "Dismiss" : "Tear down"]),
       ]),
     ]);
     card.append(row);

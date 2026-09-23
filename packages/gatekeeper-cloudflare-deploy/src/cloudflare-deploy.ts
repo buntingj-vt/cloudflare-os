@@ -683,31 +683,59 @@ export class CloudflareDeployGatekeeperImpl
     if (!pending) throw new Error(`No queued Cloudflare deploy action exists with id ${actionId}.`);
     const action = pending.action;
     const api = await this.#api();
-    try {
-      if (action.type === "deploy") {
-        const files: DeployFile[] = action.files.map((f) => ({
-          path: f.path,
-          bytes: base64ToBytes(f.contentBase64),
-          contentType: f.contentType,
-        }));
+
+    if (action.type === "deploy" || action.type === "deployRepo") {
+      try {
+        const files: DeployFile[] =
+          action.type === "deployRepo"
+            ? // Clone + build happen now (only after approval), then the same deploy loop.
+              await this.#buildRepo(action.repoUrl, action.ref)
+            : action.files.map((f) => ({
+                path: f.path,
+                bytes: base64ToBytes(f.contentBase64),
+                contentType: f.contentType,
+              }));
         await this.#applyDeploy(api, action, files);
-      } else if (action.type === "deployRepo") {
-        // Clone + build happen now (only after approval), then the same deploy loop.
-        const files = await this.#buildRepo(action.repoUrl, action.ref);
-        await this.#applyDeploy(api, action, files);
-      } else {
+      } catch (e) {
+        // Expired credentials: let the action re-queue so the user can reconnect and retry.
+        if (e instanceof CloudflareApiError && (e.status === 401 || e.status === 403)) {
+          await this.#userAccount().noteCredentialsExpired();
+          throw e;
+        }
+        // Any other build/deploy failure (unsupported repo, size cap, build error, …) must not
+        // silently loop back to the review queue as a perpetual "pending". Record the reason on the
+        // demo so the gadget can show it, then consume the action.
+        this.#markDemoFailed(action, e);
+        this.#deletePending(actionId);
+        return;
+      }
+    } else {
+      try {
         await api.deleteScript(action.scriptName);
         await api.deleteAccessAppForDomain(action.hostname);
         this.#deleteDemo(action.scriptName);
+      } catch (e) {
+        if (e instanceof CloudflareApiError && (e.status === 401 || e.status === 403)) {
+          await this.#userAccount().noteCredentialsExpired();
+        }
+        throw e;
       }
-    } catch (e) {
-      if (e instanceof CloudflareApiError && (e.status === 401 || e.status === 403)) {
-        await this.#userAccount().noteCredentialsExpired();
-      }
-      throw e;
     }
     this.#storeApplied(action);
     this.#deletePending(actionId);
+  }
+
+  /** Record a failed deploy on the demo so the gadget surfaces the reason instead of a stuck spinner. */
+  #markDemoFailed(action: DeployActionData | DeployRepoActionData, e: unknown): void {
+    this.#putDemo({
+      id: action.scriptName,
+      name: action.scriptName,
+      url: action.url,
+      private: action.private,
+      status: "failed",
+      error: e instanceof Error ? e.message : String(e),
+      createdAt: action.submittedAt,
+    });
   }
 
   async #applyDeploy(
@@ -892,6 +920,11 @@ export class CloudflareDeployGatekeeperImpl
     const scriptName = slugifyName(name);
     const demo = this.#getDemo(scriptName);
     if (!demo) throw new Error(`No demo named "${scriptName}".`);
+    // A failed demo never deployed a Worker — just drop the record; no approval or API call needed.
+    if (demo.status === "failed") {
+      this.#deleteDemo(scriptName);
+      return;
+    }
     const subdomain = await this.#subdomain();
     const hostname = `${scriptName}.${subdomain}.workers.dev`;
     const id = this.#nextActionId();
