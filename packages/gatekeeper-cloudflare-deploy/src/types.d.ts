@@ -48,10 +48,12 @@ export interface DemoDeployment {
   url: string;
   /** Whether the URL is gated by Cloudflare Access. */
   private: boolean;
-  /** "pending" until the deploy action is approved and applied, then "live". */
-  status: "pending" | "live";
+  /** "pending" until approved and applied, then "live" — or "failed" if the build/deploy errored. */
+  status: "pending" | "live" | "failed";
   /** UNIX millis when the deployment was created/queued. */
   createdAt: number;
+  /** When status is "failed", a human-readable reason (e.g. the build error). */
+  error?: string;
 }
 
 /** Metadata about the connected Cloudflare account deploy target. */
