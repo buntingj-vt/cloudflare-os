@@ -35,6 +35,14 @@ export interface DeployAssetsConfig {
   notFoundHandling?: string;
 }
 
+/** One entry of a streamed deploy's manifest — the content is fetched per-bucket, not carried here. */
+export interface AssetManifestEntry {
+  path: string;
+  /** Cloudflare's asset hash: sha256(base64(content) + extension), hex, first 32 chars. */
+  hash: string;
+  size: number;
+}
+
 const MIME: Record<string, string> = {
   ".html": "text/html", ".htm": "text/html", ".css": "text/css",
   ".js": "text/javascript", ".mjs": "text/javascript", ".json": "application/json",
@@ -190,6 +198,72 @@ export class CloudflareDeployApi {
         method: "POST",
         headers: { Authorization: `Bearer ${session.jwt}` },
         body: form,
+      });
+      const env = (await resp.json().catch(() => ({}))) as CfEnvelope<{ jwt?: string }>;
+      if (!resp.ok || env.success === false) {
+        throw new CloudflareApiError(resp.status, "/workers/assets/upload", JSON.stringify(env.errors ?? env));
+      }
+      if (env.result?.jwt) completion = env.result.jwt;
+    }
+    if (!completion) throw new Error("Asset upload finished without a completion token.");
+    return completion;
+  }
+
+  /**
+   * Streamed deploy for large sites. The caller supplies a manifest (path/hash/size) and a fetcher
+   * that returns the base64 content for a batch of paths on demand; we upload one bucket at a time,
+   * so the whole site never lives in memory. Powers data-heavy demos (e.g. 3D-model assets).
+   */
+  async deployStaticSiteStreamed(
+    scriptName: string,
+    manifest: AssetManifestEntry[],
+    fetchContent: (paths: string[]) => Promise<Record<string, string>>,
+    config: DeployAssetsConfig = {},
+  ): Promise<void> {
+    if (manifest.length === 0) throw new Error("Cannot deploy an empty site (no files).");
+    const completionToken = await this.#uploadAssetsStreamed(scriptName, manifest, fetchContent);
+    await this.#putAssetsOnlyScript(scriptName, completionToken, config);
+  }
+
+  async #uploadAssetsStreamed(
+    scriptName: string,
+    manifest: AssetManifestEntry[],
+    fetchContent: (paths: string[]) => Promise<Record<string, string>>,
+  ): Promise<string> {
+    const cfManifest: Record<string, { hash: string; size: number }> = {};
+    const hashToPath = new Map<string, string>();
+    for (const e of manifest) {
+      const p = e.path.replace(/^\/+/, "");
+      cfManifest["/" + p] = { hash: e.hash, size: e.size };
+      if (!hashToPath.has(e.hash)) hashToPath.set(e.hash, p);
+    }
+
+    const session = await this.#json<{ jwt: string; buckets?: string[][] }>(
+      "POST", this.#acct(`/workers/scripts/${encodeURIComponent(scriptName)}/assets-upload-session`),
+      { manifest: cfManifest },
+    );
+    const buckets = session.buckets ?? [];
+    if (buckets.length === 0) return session.jwt; // all assets already present (dedup)
+
+    let completion: string | null = null;
+    for (const bucket of buckets) {
+      // Pull only this bucket's files, upload, then discard — bounded memory regardless of site size.
+      const paths = bucket.map((hash) => {
+        const p = hashToPath.get(hash);
+        if (!p) throw new Error(`Upload session requested unknown asset hash ${hash}.`);
+        return p;
+      });
+      const content = await fetchContent(paths);
+      const form = new FormData();
+      for (const hash of bucket) {
+        const p = hashToPath.get(hash)!;
+        const base64 = content[p];
+        if (base64 === undefined) throw new Error(`Build service did not return content for ${p}.`);
+        const type = MIME[extname(p)] ?? "application/octet-stream";
+        form.append(hash, new Blob([base64], { type }), p);
+      }
+      const resp = await fetch(`${API_BASE}${this.#acct("/workers/assets/upload")}?base64=true`, {
+        method: "POST", headers: { Authorization: `Bearer ${session.jwt}` }, body: form,
       });
       const env = (await resp.json().catch(() => ({}))) as CfEnvelope<{ jwt?: string }>;
       if (!resp.ok || env.success === false) {
