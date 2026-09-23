@@ -41,9 +41,17 @@ type Env = Cloudflare.Env & {
   BUILD_SERVICE_SECRET?: string;
 };
 
+interface BuildWorkerBundle {
+  mainModule: string;
+  contentBase64: string;
+  compatibilityDate: string;
+  compatibilityFlags: string[];
+}
 type BuildServiceResponse =
-  | { ok: true; type: string; entry: string; buildId: string; manifest: AssetManifestEntry[]; totalBytes: number }
+  | { ok: true; kind: "static"; type: string; entry: string; buildId: string; manifest: AssetManifestEntry[]; totalBytes: number }
+  | { ok: true; kind: "worker"; type: string; entry: string; buildId: string; manifest: AssetManifestEntry[]; worker: BuildWorkerBundle; totalBytes: number }
   | { ok: false; error: string; stage: string; log?: string };
+type BuildStarted = Extract<BuildServiceResponse, { ok: true }>;
 type BuildContentResponse =
   | { ok: true; files: Record<string, string> }
   | { ok: false; error: string };
@@ -686,15 +694,30 @@ export class CloudflareDeployGatekeeperImpl
     if (action.type === "deploy" || action.type === "deployRepo") {
       try {
         if (action.type === "deployRepo") {
-          // Clone + build happen now (only after approval). The build service keeps the built site in
-          // a sandbox; we stream it up one bucket at a time, so a large site never buffers in memory.
+          // Clone + build happen now (only after approval). The build service keeps the built output
+          // in a sandbox; we stream it up one bucket at a time, so nothing large buffers in memory.
           const build = await this.#startBuild(action.repoUrl, action.ref);
           try {
-            await api.deployStaticSiteStreamed(
-              action.scriptName,
-              build.manifest,
-              (paths) => this.#pullBuildContent(build.buildId, paths),
-            );
+            if (build.kind === "worker") {
+              // A server (SSR) demo: deploy a real Worker (module + assets), ASSETS binding only.
+              await api.deployWorkerSite(
+                action.scriptName,
+                {
+                  mainModule: build.worker.mainModule,
+                  moduleBytes: base64ToBytes(build.worker.contentBase64),
+                  compatibilityDate: build.worker.compatibilityDate,
+                  compatibilityFlags: build.worker.compatibilityFlags,
+                },
+                build.manifest,
+                (paths) => this.#pullBuildContent(build.buildId, paths),
+              );
+            } else {
+              await api.deployStaticSiteStreamed(
+                action.scriptName,
+                build.manifest,
+                (paths) => this.#pullBuildContent(build.buildId, paths),
+              );
+            }
             await this.#finishDeploy(api, action);
           } finally {
             await this.#releaseBuild(build.buildId);
@@ -786,13 +809,13 @@ export class CloudflareDeployGatekeeperImpl
     });
   }
 
-  /** Kick off a clone+build; returns the manifest + a build id for streaming the output out. */
-  async #startBuild(repoUrl: string, ref?: string): Promise<{ buildId: string; manifest: AssetManifestEntry[] }> {
+  /** Kick off a clone+build; returns the build (kind + manifest + build id, and worker bundle if SSR). */
+  async #startBuild(repoUrl: string, ref?: string): Promise<BuildStarted> {
     const resp = await this.#buildServiceCall({ repoUrl, ref });
     const data = (await resp.json().catch(() => null)) as BuildServiceResponse | null;
     if (!data) throw new Error(`Build service returned a non-JSON response (HTTP ${resp.status}).`);
     if (!data.ok) throw new Error(`Build failed at ${data.stage}: ${data.error}`);
-    return { buildId: data.buildId, manifest: data.manifest };
+    return data;
   }
 
   /** Fetch a batch of built files (base64) from the kept-alive build sandbox. */

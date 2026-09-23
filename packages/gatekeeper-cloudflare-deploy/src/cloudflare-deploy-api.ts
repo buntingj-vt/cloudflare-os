@@ -275,6 +275,60 @@ export class CloudflareDeployApi {
     return completion;
   }
 
+  /**
+   * Deploy a **module Worker with a server** (SSR framework via an adapter) plus its static assets.
+   * The single bundled module rides in `worker.moduleBytes`; assets stream via the manifest like a
+   * static deploy. Binds only `ASSETS` — no sensitive bindings (the zero-binding invariant for
+   * untrusted server demos).
+   */
+  async deployWorkerSite(
+    scriptName: string,
+    worker: {
+      mainModule: string;
+      moduleBytes: Uint8Array;
+      compatibilityDate: string;
+      compatibilityFlags: string[];
+    },
+    assetsManifest: AssetManifestEntry[],
+    fetchContent: (paths: string[]) => Promise<Record<string, string>>,
+  ): Promise<void> {
+    const completionToken =
+      assetsManifest.length > 0
+        ? await this.#uploadAssetsStreamed(scriptName, assetsManifest, fetchContent)
+        : null;
+
+    const metadata: Record<string, unknown> = {
+      main_module: worker.mainModule,
+      compatibility_date: worker.compatibilityDate,
+      compatibility_flags: worker.compatibilityFlags,
+      // ASSETS is the only binding — never anything sensitive (see the zero-binding invariant).
+      bindings: [{ type: "assets", name: "ASSETS" }],
+    };
+    if (completionToken) {
+      metadata.assets = {
+        jwt: completionToken,
+        // Serve a matching static asset; otherwise fall through to the Worker (SSR handles routing).
+        config: { html_handling: "auto-trailing-slash", not_found_handling: "none" },
+      };
+    }
+
+    const form = new FormData();
+    form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+    form.append(
+      worker.mainModule,
+      new Blob([worker.moduleBytes], { type: "application/javascript+module" }),
+      worker.mainModule,
+    );
+    const resp = await fetch(
+      `${API_BASE}${this.#acct(`/workers/scripts/${encodeURIComponent(scriptName)}`)}`,
+      { method: "PUT", headers: { Authorization: `Bearer ${this.#token}` }, body: form },
+    );
+    const env = (await resp.json().catch(() => ({}))) as CfEnvelope<unknown>;
+    if (!resp.ok || env.success === false) {
+      throw new CloudflareApiError(resp.status, `/workers/scripts/${scriptName}`, JSON.stringify(env.errors ?? env));
+    }
+  }
+
   /** Step 3: PUT an assets-only Worker (no user code) referencing the uploaded assets. */
   async #putAssetsOnlyScript(
     scriptName: string,
