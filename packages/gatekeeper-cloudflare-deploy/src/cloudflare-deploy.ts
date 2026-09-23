@@ -21,7 +21,7 @@ import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/co
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import ACCOUNT_CONFIGURATOR_HTML from "./generated/account-configurator-ui.txt";
 import type { CloudflareAccountConfiguratorRpc } from "./configurator/account-configurator-types";
-import { CloudflareApiError, CloudflareDeployApi, type DeployFile } from "./cloudflare-deploy-api";
+import { CloudflareApiError, CloudflareDeployApi, type AssetManifestEntry, type DeployFile } from "./cloudflare-deploy-api";
 import type {
   CloudflareDeploySession,
   DemoDeployment,
@@ -41,13 +41,12 @@ type Env = Cloudflare.Env & {
   BUILD_SERVICE_SECRET?: string;
 };
 
-interface BuildServiceFile {
-  path: string;
-  contentBase64: string;
-}
 type BuildServiceResponse =
-  | { ok: true; type: string; entry: string; files: BuildServiceFile[]; totalBytes: number }
+  | { ok: true; type: string; entry: string; buildId: string; manifest: AssetManifestEntry[]; totalBytes: number }
   | { ok: false; error: string; stage: string; log?: string };
+type BuildContentResponse =
+  | { ok: true; files: Record<string, string> }
+  | { ok: false; error: string };
 
 const NONCE_BYTES = 32;
 const NONCE_LIFETIME_MS = 10 * 60 * 1000;
@@ -686,16 +685,29 @@ export class CloudflareDeployGatekeeperImpl
 
     if (action.type === "deploy" || action.type === "deployRepo") {
       try {
-        const files: DeployFile[] =
-          action.type === "deployRepo"
-            ? // Clone + build happen now (only after approval), then the same deploy loop.
-              await this.#buildRepo(action.repoUrl, action.ref)
-            : action.files.map((f) => ({
-                path: f.path,
-                bytes: base64ToBytes(f.contentBase64),
-                contentType: f.contentType,
-              }));
-        await this.#applyDeploy(api, action, files);
+        if (action.type === "deployRepo") {
+          // Clone + build happen now (only after approval). The build service keeps the built site in
+          // a sandbox; we stream it up one bucket at a time, so a large site never buffers in memory.
+          const build = await this.#startBuild(action.repoUrl, action.ref);
+          try {
+            await api.deployStaticSiteStreamed(
+              action.scriptName,
+              build.manifest,
+              (paths) => this.#pullBuildContent(build.buildId, paths),
+            );
+            await this.#finishDeploy(api, action);
+          } finally {
+            await this.#releaseBuild(build.buildId);
+          }
+        } else {
+          const files: DeployFile[] = action.files.map((f) => ({
+            path: f.path,
+            bytes: base64ToBytes(f.contentBase64),
+            contentType: f.contentType,
+          }));
+          await api.deployStaticSite(action.scriptName, files);
+          await this.#finishDeploy(api, action);
+        }
       } catch (e) {
         // Expired credentials: let the action re-queue so the user can reconnect and retry.
         if (e instanceof CloudflareApiError && (e.status === 401 || e.status === 403)) {
@@ -738,13 +750,12 @@ export class CloudflareDeployGatekeeperImpl
     });
   }
 
-  async #applyDeploy(
+  /** Post-upload steps shared by both deploy paths: enable the subdomain, gate it, mark it live. */
+  async #finishDeploy(
     api: CloudflareDeployApi,
     action: DeployActionData | DeployRepoActionData,
-    files: DeployFile[],
   ): Promise<void> {
     const subdomain = await this.#subdomain();
-    await api.deployStaticSite(action.scriptName, files);
     await api.enableSubdomain(action.scriptName, subdomain);
     if (action.private && action.accessEmail) {
       await api.ensureAccessApp(action.hostname, action.accessEmail);
@@ -759,8 +770,7 @@ export class CloudflareDeployGatekeeperImpl
     });
   }
 
-  /** Call the build service to clone+build a repo and return its static output as deploy files. */
-  async #buildRepo(repoUrl: string, ref?: string): Promise<DeployFile[]> {
+  #buildServiceCall(body: object): Promise<Response> {
     const url = this.env.BUILD_SERVICE_URL;
     const secret = this.env.BUILD_SERVICE_SECRET;
     if (!url || !secret) {
@@ -769,15 +779,35 @@ export class CloudflareDeployGatekeeperImpl
           "the Cloudflare deploy gatekeeper to enable GitHub-repo builds.",
       );
     }
-    const resp = await fetch(url, {
+    return fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
-      body: JSON.stringify({ repoUrl, ref }),
+      body: JSON.stringify(body),
     });
+  }
+
+  /** Kick off a clone+build; returns the manifest + a build id for streaming the output out. */
+  async #startBuild(repoUrl: string, ref?: string): Promise<{ buildId: string; manifest: AssetManifestEntry[] }> {
+    const resp = await this.#buildServiceCall({ repoUrl, ref });
     const data = (await resp.json().catch(() => null)) as BuildServiceResponse | null;
     if (!data) throw new Error(`Build service returned a non-JSON response (HTTP ${resp.status}).`);
     if (!data.ok) throw new Error(`Build failed at ${data.stage}: ${data.error}`);
-    return data.files.map((f) => ({ path: f.path, bytes: base64ToBytes(f.contentBase64) }));
+    return { buildId: data.buildId, manifest: data.manifest };
+  }
+
+  /** Fetch a batch of built files (base64) from the kept-alive build sandbox. */
+  async #pullBuildContent(buildId: string, paths: string[]): Promise<Record<string, string>> {
+    const resp = await this.#buildServiceCall({ action: "content", buildId, paths });
+    const data = (await resp.json().catch(() => null)) as BuildContentResponse | null;
+    if (!data || !data.ok) {
+      throw new Error(`Failed to fetch built files: ${data && !data.ok ? data.error : `HTTP ${resp.status}`}`);
+    }
+    return data.files;
+  }
+
+  /** Free the build sandbox after upload (best-effort; the platform idle-stops it otherwise). */
+  async #releaseBuild(buildId: string): Promise<void> {
+    try { await this.#buildServiceCall({ action: "release", buildId }); } catch { /* idle-stop reaps it */ }
   }
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
