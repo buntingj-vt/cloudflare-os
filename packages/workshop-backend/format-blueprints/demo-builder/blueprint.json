@@ -1,0 +1,22 @@
+{
+  "$comment": "Format-blueprint manifest for the Demo Builder gadget. Paired with the sibling server.js/client.js/README.md. bindings is intentionally empty: the manifest parser does not validate binding shapes and the correct gatekeeper adapter string can't be hand-authored, so the CF_DEPLOY binding is wired post-instantiation (Connections → bind this gadget to the Cloudflare deploy gatekeeper). Bump revision to force a reinstall on redeploy.",
+  "blueprintId": "demo-builder",
+  "title": "Demo Builder",
+  "description": "Deploy a private copy of a static site on Cloudflare and get a private workers.dev URL to click around. Paste HTML or a static page URL today; full GitHub-repo builds arrive with the build service.",
+  "output": {
+    "id": "demo-builder",
+    "noun": "Demo",
+    "plural": "Demos",
+    "icon": "appWindow"
+  },
+  "author": {
+    "type": "user",
+    "name": "Jon Bunting",
+    "id": "me@jonbunting.com"
+  },
+  "revision": 1,
+  "created": "2026-09-16T00:00:00.000Z",
+  "version": 1,
+  "lastUpdated": "2026-09-16T00:00:00.000Z",
+  "bindings": {}
+}
