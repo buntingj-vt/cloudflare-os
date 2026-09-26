@@ -76,7 +76,7 @@ export class Gadget extends DurableObject {
     return { connected: true, account, demos, error };
   }
 
-  // Deploy a single pasted HTML page as a private demo.
+  /** Deploy a single pasted HTML page as a private demo. */
   async deployHtml(name, html) {
     const deploy = this.#requireDeploy();
     const bytes = new TextEncoder().encode(String(html ?? ""));
@@ -91,8 +91,10 @@ export class Gadget extends DurableObject {
     return { demo, state: await this.getState() };
   }
 
-  // Fetch a single static page by URL and deploy it as a private demo. Grabs only that page
-  // (linked assets aren't followed — full sites/repos need the Phase 2 build service).
+  /**
+   * Fetch a single static page by URL and deploy it as a private demo. Grabs only that page
+   * (linked assets aren't followed — full sites/repos need the Phase 2 build service).
+   */
   async deployFromUrl(name, url) {
     const deploy = this.#requireDeploy();
     const parsed = assertPublicHttpUrl(url);
@@ -100,7 +102,7 @@ export class Gadget extends DurableObject {
     try {
       resp = await fetch(parsed.toString(), { redirect: "follow" });
     } catch (e) {
-      throw new Error(`Couldn't fetch ${parsed.hostname}: ${(e && e.message) || e}`);
+      throw new Error(`Couldn't fetch ${parsed.hostname}: ${(e && e.message) || e}`, { cause: e });
     }
     if (!resp.ok) throw new Error(`Fetch failed: HTTP ${resp.status} from ${parsed.hostname}.`);
     const buf = new Uint8Array(await resp.arrayBuffer());
@@ -115,8 +117,10 @@ export class Gadget extends DurableObject {
     return { demo, state: await this.getState() };
   }
 
-  // Clone + build a GitHub repo in a container (via the gatekeeper's build service) and deploy its
-  // static output as a private demo. The clone/build runs only after you approve the action.
+  /**
+   * Clone + build a GitHub repo in a container (via the gatekeeper's build service) and deploy its
+   * static output as a private demo. The clone/build runs only after you approve the action.
+   */
   async deployFromRepo(name, repoUrl, ref) {
     const deploy = this.#requireDeploy();
     const url = String(repoUrl ?? "").trim();

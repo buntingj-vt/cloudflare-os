@@ -12,7 +12,7 @@ export default function AmbientBackground() {
   useEffect(() => {
     const el = ref.current
     if (!el) return
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    if (typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
 
     // Target = pointer, current = eased position, both as viewport fractions (0..1).
     let targetX = 0.5

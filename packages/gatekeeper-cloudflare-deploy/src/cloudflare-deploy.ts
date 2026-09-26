@@ -673,7 +673,7 @@ export class CloudflareDeployGatekeeperImpl
     return new CloudflareDeploySessionImpl(this, approvalQueue.dup());
   }
 
-  // Personal single-account resource: low-stakes observer strategy (see gatekeeper-homeassistant).
+  /** Personal single-account resource: low-stakes observer strategy (see gatekeeper-homeassistant). */
   async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
   async removeObserver(_id: string): Promise<void> {}
 
